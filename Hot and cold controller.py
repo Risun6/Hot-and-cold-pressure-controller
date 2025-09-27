@@ -5,6 +5,7 @@ import csv
 import time
 import struct
 import serial
+import socket
 import threading
 from tkinter import filedialog
 from math import isnan, sqrt
@@ -18,6 +19,8 @@ from ttkbootstrap.constants import *
 from tkinter import messagebox
 import serial.tools.list_ports
 
+from tcp_utils import JSONLineServer
+
 # ---- 可选依赖：鼠标/键盘 ----
 try:
     import pyautogui
@@ -25,23 +28,11 @@ try:
 except Exception:
     pyautogui = None
 
-try:
-    import keyboard   # 全局热键库（可选）
-except Exception:
-    keyboard = None
-
-import sys, ctypes
-# ---- Windows 鼠标坐标结构体 ----
-if sys.platform.startswith("win"):
-    class _POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+import sys
 
 if getattr(sys, "frozen", False):
     pyautogui = None
-    keyboard = None
 
-import sys
-import ctypes
 import time as _time
 
 # Matplotlib for live plots
@@ -62,6 +53,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 APP_NAME = "PID 冷热台控温（Modbus-RTU）"
 CONFIG_DIRNAME = "PID_冷热台"
 CONFIG_FILENAME = "config.json"
+
+TCP_HOST = "127.0.0.1"
+TCP_PORT = 50010
 
 PSU_BAUD = 9600   # 8N1
 TCM_BAUD = 57600  # 8N1
@@ -822,6 +816,7 @@ class App:
         # 缓冲与绘图
         self.history_seconds = 15 * 60
         maxlen = int(self.history_seconds * self.params["sample_hz"])
+        self.history_lock = threading.Lock()
         self.t_buf = deque(maxlen=maxlen)
         self.pump_v_buf = deque(maxlen=maxlen)
         self.pump_i_buf = deque(maxlen=maxlen)
@@ -856,18 +851,10 @@ class App:
         self.slope_start_thr_cpm = tk.DoubleVar(value=0.30)  # CSV 开始阈：|斜率|≥此值（°C/min）
         self.slope_stop_thr_cpm = tk.DoubleVar(value=0.08)  # CSV 停止阈：|斜率|≤此值（°C/min）
 
-        # —— 模拟点击设置（用 StringVar，避免空值崩溃）——
-        self.auto_click_enable = tk.BooleanVar(value=False)
-        self.auto_click_x = tk.StringVar(value="0")  # ← StringVar
-        self.auto_click_y = tk.StringVar(value="0")  # ← StringVar
-        self.auto_click_button = tk.StringVar(value="left")
-        self.auto_click_double = tk.BooleanVar(value=False)
-        self.auto_click_delay_ms = tk.StringVar(value="0")  # ← StringVar
-
-        # —— 坐标拾取运行态 ——
-        self._pick_running = False
-        self.pick_preview = tk.StringVar(value="X=—, Y=—")  # 实时预览
-        self._kb_hotkey_id = None  # keyboard 热键句柄
+        # —— 模拟点击设置 ——
+        self.sim_click_enabled = tk.BooleanVar(value=False)
+        self.sim_click_pos = None
+        self.sim_click_label = tk.StringVar(value="未设置")
 
         # ==== 循环泵对象 / PID（冷却） ====
         self.pump = CoolingPump()
@@ -961,10 +948,17 @@ class App:
 
         # UI
         self._build_ui()
-        self._sync_click_vars_to_entries()
         self._load_config()
         self._refresh_ports()
         self._schedule_gui_update()
+
+        # 启动 TCP 控制服务
+        self.tcp_server = JSONLineServer(TCP_HOST, TCP_PORT, self._handle_tcp_command, name="temp-controller")
+        try:
+            self.tcp_server.start()
+        except OSError as exc:
+            self.tcp_server = None
+            self._set_status(f"TCP服务启动失败: {exc}")
 
 
     # ---------- UI ----------
@@ -1297,46 +1291,19 @@ class App:
             .pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(rowD, text="V").pack(side=tk.LEFT, padx=(4, 0))
 
-        # === 模拟点击（开始线性时触发） ===
-        clickf = ttk.Labelframe(left, text="模拟点击（开始线性时）", padding=10)
+        # === 模拟点击 ===
+        clickf = ttk.Labelframe(left, text="模拟点击", padding=10)
         clickf.pack(fill=tk.X, pady=8)
 
-        r0 = ttk.Frame(clickf);
-        r0.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(r0, text="启用", variable=self.auto_click_enable).pack(side=tk.LEFT)
-        ttk.Label(r0, text="延迟(ms)").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(r0, textvariable=self.auto_click_delay_ms, width=8).pack(side=tk.LEFT)
+        click_row = ttk.Frame(clickf)
+        click_row.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(click_row, text="启用模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(click_row, text="设置点击点", command=self.set_sim_click_point,
+                   bootstyle="outline-info").pack(side=tk.LEFT, padx=4)
+        ttk.Label(click_row, textvariable=self.sim_click_label, width=18).pack(side=tk.LEFT, padx=4)
+        ttk.Label(click_row, text="(窗口提示后按 Enter)").pack(side=tk.LEFT, padx=4)
 
-        r1 = ttk.Frame(clickf);
-        r1.pack(fill=tk.X, pady=2)
-        ttk.Label(r1, text="屏幕X").pack(side=tk.LEFT)
-        self.ent_auto_x = ttk.Entry(r1, textvariable=self.auto_click_x, width=8)
-        self.ent_auto_x.pack(side=tk.LEFT, padx=(4, 12))
-
-        ttk.Label(r1, text="屏幕Y").pack(side=tk.LEFT)
-        self.ent_auto_y = ttk.Entry(r1, textvariable=self.auto_click_y, width=8)
-        self.ent_auto_y.pack(side=tk.LEFT, padx=(4, 12))
-
-        ttk.Label(r1, text="按键").pack(side=tk.LEFT)
-        ttk.Combobox(r1, textvariable=self.auto_click_button, width=8,
-                     values=["left", "right", "middle"]).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Checkbutton(r1, text="双击", variable=self.auto_click_double).pack(side=tk.LEFT)
-
-        # —— 坐标拾取 ——
-        r2 = ttk.Frame(clickf);
-        r2.pack(fill=tk.X, pady=2)
-        ttk.Label(r2, textvariable=self.pick_preview, width=18).pack(side=tk.LEFT)
-        ttk.Button(r2, text="按 Enter 取点", command=self._start_pick_coord_enter).pack(side=tk.LEFT, padx=(6, 6))
-        ttk.Button(r2, text="停止拾取", command=self._stop_pick_coord).pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Button(clickf, text="立即测试点击",
-                   command=lambda: self._simulate_click(
-                       int(self.auto_click_x.get() or 0),
-                       int(self.auto_click_y.get() or 0),
-                       self.auto_click_button.get(),
-                       bool(self.auto_click_double.get()),
-                       int(self.auto_click_delay_ms.get() or 0)
-                   ),
+        ttk.Button(clickf, text="立即执行", command=self.perform_sim_click,
                    bootstyle=SECONDARY).pack(anchor="e", pady=(6, 0))
 
         # 数据记录
@@ -1426,18 +1393,6 @@ class App:
             except Exception:
                 pass
 
-
-    def _sync_click_vars_to_entries(self):
-        """把变量值强制刷新到 Entry（启动与加载配置后各调一次）。"""
-        try:
-            if hasattr(self, "ent_auto_x"):
-                self.ent_auto_x.delete(0, "end");
-                self.ent_auto_x.insert(0, str(int(self.auto_click_x.get() or 0)))
-            if hasattr(self, "ent_auto_y"):
-                self.ent_auto_y.delete(0, "end");
-                self.ent_auto_y.insert(0, str(int(self.auto_click_y.get() or 0)))
-        except Exception:
-            pass
 
     # ---------- 串口 ----------
     def _refresh_ports(self):
@@ -1774,21 +1729,20 @@ class App:
         没有足够点则返回 None。
         """
         try:
-            t_list = list(self.t_buf)
-            e_list = list(self.err_buf)
+            with self.history_lock:
+                t_list = list(self.t_buf)
+                e_list = list(self.err_buf)
             if not t_list or not e_list:
                 return None
             t_now = t_list[-1]
             t_min = t_now - max(1.0, float(window_s))
-            i0 = 0
-            for i in range(len(t_list) - 1, -1, -1):
-                if t_list[i] < t_min:
-                    i0 = i + 1
-                    break
-            ew = [e for e in e_list[i0:] if (e is not None and not isnan(e))]
-            if len(ew) < 5:
+            errors = [
+                e for t, e in zip(t_list, e_list)
+                if t >= t_min and e is not None and not isnan(e)
+            ]
+            if len(errors) < 5:
                 return None
-            return sum(abs(x) for x in ew) / len(ew)
+            return sum(abs(x) for x in errors) / len(errors)
         except Exception:
             return None
 
@@ -1922,6 +1876,33 @@ class App:
         except Exception:
             pass
 
+    def _tk_call_sync(self, fn, *args, **kwargs):
+        """在主线程同步执行函数并返回结果。"""
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args, **kwargs)
+
+        result = {}
+        event = threading.Event()
+
+        def wrapper():
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+            finally:
+                event.set()
+
+        try:
+            self.root.after(0, wrapper)
+            if not event.wait(timeout=3.0):
+                raise TimeoutError("UI thread unresponsive")
+        except Exception:
+            raise
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
     def _tk_set(self, tkvar, value):
         """线程安全地设置 Tk 变量."""
         self._tk_call(lambda v: tkvar.set(v), value)
@@ -2025,14 +2006,15 @@ class App:
         self.acq_running = False
         self._set_status("采集已停止")
 
-    def enable_pid(self, origin="user"):
+    def enable_pid(self, origin="user", notify=True):
         # 防抖，避免双击反复开文件
         if origin == "user" and not self._debounce("enable_pid"):
-            return
+            return False
 
         if not self.acq_running:
-            messagebox.showwarning("提示", "请先连接设备，采集会自动开始。")
-            return
+            if notify:
+                messagebox.showwarning("提示", "请先连接设备，采集会自动开始。")
+            return False
         try:
             # 同步参数
             self._sync_params_to_background()
@@ -2056,7 +2038,7 @@ class App:
             except Exception:
                 ok_temp = False
 
-            if not ok_temp:
+            if not ok_temp and notify:
                 messagebox.showwarning("提示", "温度仪暂未返回有效读数，将在采集循环中继续等待（不阻塞）。")
 
             # 打开输出并把当前设定电压明确写回（0 或上次值）
@@ -2081,8 +2063,12 @@ class App:
                 # 若 PID 已在运行，这里等价“切换新文件”，不会重置控制
                 self._csv_open_session("启动PID")
 
+            return True
+
         except Exception as e:
-            messagebox.showerror("错误", f"开启输出失败：\n{e}")
+            if notify:
+                messagebox.showerror("错误", f"开启输出失败：\n{e}")
+            return False
 
     def disable_pid(self):
         # 防抖
@@ -2129,31 +2115,42 @@ class App:
         self._save_config()
 
     # ---------- 线性程序 ----------
-    def _start_ramp(self):
+    def _start_ramp(self, origin="user", notify=True):
         if self.ramp_active:
-            messagebox.showinfo("提示", "线性程序已在运行。")
-            return
+            if notify:
+                messagebox.showinfo("提示", "线性程序已在运行。")
+            return False
         if not self.acq_running:
-            messagebox.showwarning("提示", "未在采集状态，无法执行线性程序。请先连接设备。")
-            return
+            if notify:
+                messagebox.showwarning("提示", "未在采集状态，无法执行线性程序。请先连接设备。")
+            return False
 
         # 防抖
-        if not self._debounce("start_ramp"):
-            return
+        if origin == "user" and not self._debounce("start_ramp"):
+            return False
 
         t0 = safe_float(self.ramp_start.get(), None)
         t1 = safe_float(self.ramp_end.get(), None)
         rate = safe_float(self.ramp_rate.get(), None)  # °C/min
         holdm = max(0.0, safe_float(self.ramp_hold_min.get(), 0.0) or 0.0)
         if None in (t0, t1, rate) or rate <= 0:
-            messagebox.showerror("错误", "请正确填写 起点/终点/速率(>0)。")
-            return
+            if notify:
+                messagebox.showerror("错误", "请正确填写 起点/终点/速率(>0)。")
+            return False
+
+        try:
+            if self.sim_click_enabled.get() and not self.sim_click_pos:
+                if notify:
+                    messagebox.showwarning("提示", "未设置模拟点击点，已自动关闭模拟点击。")
+                self.sim_click_enabled.set(False)
+        except Exception:
+            pass
 
         # 若未启 PID，这里自动启（但标记为 ramp 来源，避免重复开 CSV）
         if not self.control_enabled:
-            self.enable_pid(origin="ramp")
+            self.enable_pid(origin="ramp", notify=notify)
             if not self.control_enabled:
-                return
+                return False
 
         # ★ 不在这里开CSV（等真正进入线性段时再开）
         with self.params_lock:
@@ -2171,6 +2168,7 @@ class App:
             daemon=True
         )
         self.ramp_thread.start()
+        return True
 
     def _ramp_worker(self, t0, t1, rate_c_per_min, hold_min, wait_to_start=True, loop=False):
         """
@@ -2180,7 +2178,7 @@ class App:
           - CSV：斜率跨过起止阈则开/停，段与段之间自动收尾/重开；
           - “循环变温”勾选关闭后，本段结束即停止；“停止线性程序”立即停止。
         """
-        setattr(self, "_auto_click_done_this_ramp", False)
+        setattr(self, "_sim_click_done_this_ramp", False)
 
         def _apply_target_now(val: float):
             with self.params_lock:
@@ -2267,11 +2265,9 @@ class App:
                     self._set_status(f"线性程序：斜率 |{slope_cpm:.3f}|≥{thr_start:.3f} °C/min，开始记录 CSV")
                     csv_started = True
                     below_stop_since = None
-                    if hasattr(self, "_try_auto_click_start") and first_segment and not getattr(self,
-                                                                                                "_auto_click_done_this_ramp",
-                                                                                                False):
-                        self._try_auto_click_start()
-                        setattr(self, "_auto_click_done_this_ramp", True)
+                    if first_segment and not getattr(self, "_sim_click_done_this_ramp", False):
+                        self.maybe_sim_click()
+                        setattr(self, "_sim_click_done_this_ramp", True)
 
                 # 停止：低于停止阈且持续≥2 s
                 if csv_started and (slope_cpm is not None) and (abs(slope_cpm) <= thr_stop):
@@ -2346,6 +2342,131 @@ class App:
         self._set_status("线性程序已停止")
         # 停止线性程序 => 保存 CSV
         self._csv_close_session("停止线性程序")
+
+    # ---------- TCP 控制接口 ----------
+    def _handle_tcp_command(self, request):
+        cmd = str(request.get("cmd", "")).strip().lower()
+        if not cmd:
+            raise ValueError("missing cmd")
+
+        if cmd == "ping":
+            return {"timestamp": time.time()}
+
+        if cmd == "status":
+            return {"status": self.get_tcp_status()}
+
+        if cmd == "set_target":
+            if "value" not in request:
+                raise ValueError("missing value")
+            allow = bool(request.get("allow_ramp", False))
+            self.set_target_temperature(request["value"], allow_during_ramp=allow)
+            if request.get("start", False):
+                self.start_pid_remote()
+            return {"result": "target-updated"}
+
+        if cmd == "start_pid":
+            ok = self.start_pid_remote()
+            return {"result": ok}
+
+        if cmd == "stop_pid":
+            self.stop_pid_remote()
+            return {"result": True}
+
+        if cmd == "start_ramp":
+            params = request.get("params", {})
+            start = params.get("start", request.get("start"))
+            end = params.get("end", request.get("end"))
+            rate = params.get("rate", request.get("rate"))
+            if start is None or end is None or rate is None:
+                raise ValueError("start/end/rate required")
+            hold = params.get("hold", request.get("hold", 0.0))
+            loop = params.get("loop", request.get("loop", False))
+            ok = self.start_ramp_remote(start, end, rate, hold=hold, loop=loop)
+            return {"result": ok}
+
+        if cmd == "stop_ramp":
+            self.stop_ramp_remote()
+            return {"result": True}
+
+        raise ValueError(f"unknown cmd: {cmd}")
+
+    def get_tcp_status(self):
+        metrics = self._compute_error_metrics()
+        with self.rt_lock:
+            rt = dict(self.rt)
+        with self.params_lock:
+            target = float(self.params.get("target", 0.0))
+        try:
+            display_target = float(self.target_temp.get())
+            if display_target == display_target:
+                target = float(display_target)
+        except Exception:
+            pass
+
+        def _safe(value):
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if v != v:
+                return None
+            return v
+
+        status = {
+            "timestamp": time.time(),
+            "acq_running": bool(self.acq_running),
+            "pid_enabled": bool(self.control_enabled),
+            "ramp_active": bool(getattr(self, "ramp_active", False)),
+            "target": target,
+            "temperature": _safe(rt.get("temp")),
+            "voltage": _safe(rt.get("v_out")),
+            "current": _safe(rt.get("a_out")),
+            "power": _safe(rt.get("p_out")),
+            "error": _safe(rt.get("err")),
+            "mae": metrics.get("mae"),
+            "rmse": metrics.get("rmse"),
+            "hit_ratio": metrics.get("hit_ratio"),
+            "window": metrics.get("window"),
+            "samples": metrics.get("samples"),
+            "note": rt.get("note"),
+        }
+        if self._acq_t0 and metrics.get("last_time") is not None:
+            status["last_sample_ts"] = self._acq_t0 + metrics["last_time"]
+        return status
+
+    def set_target_temperature(self, value, allow_during_ramp=False):
+        value = float(value)
+        if value > TEMP_LIMIT_CUTOFF:
+            raise ValueError(f"目标温度 {value:.2f} 超过安全上限 {TEMP_LIMIT_CUTOFF:.1f}°C")
+        if not allow_during_ramp and getattr(self, "ramp_active", False):
+            raise RuntimeError("ramp active")
+        with self.params_lock:
+            self.params["target"] = float(value)
+        self._last_valid_target = float(value)
+        self._tk_set(self.target_temp, f"{float(value):.3f}")
+        return True
+
+    def start_pid_remote(self):
+        return self.enable_pid(origin="tcp", notify=False)
+
+    def stop_pid_remote(self):
+        self.disable_pid()
+        return True
+
+    def start_ramp_remote(self, start, end, rate, hold=0.0, loop=False):
+        def runner():
+            self.ramp_start.set(f"{float(start):.3f}")
+            self.ramp_end.set(f"{float(end):.3f}")
+            self.ramp_rate.set(f"{float(rate):.3f}")
+            self.ramp_hold_min.set(f"{float(max(0.0, hold)):.3f}")
+            self.ramp_cycle_enable.set(bool(loop))
+            return self._start_ramp(origin="tcp", notify=False)
+
+        return bool(self._tk_call_sync(runner))
+
+    def stop_ramp_remote(self):
+        self._tk_call(self._stop_ramp)
+        return True
 
     # ---------- Tk 参数同步 ----------
     def _sync_params_to_background(self):
@@ -2874,16 +2995,17 @@ class App:
                     "pump_vset": pvset_pub,  # 统一的“等效 Vset”
                 })
 
-            self.t_buf.append(t_rel)
-            self.temp_buf.append(None if (temp_filt is None or not (temp_filt == temp_filt)) else float(temp_filt))
-            self.power_buf.append(p_out)
-            with self.params_lock:
-                cur_target = float(self.params["target"])
-            self.target_buf.append(cur_target)
-            self.err_buf.append(None if not (err_phys == err_phys) else float(err_phys))
-            if hasattr(self, "pump_v_buf"): self.pump_v_buf.append(pump_v if pump_connected else None)
-            if hasattr(self, "pump_i_buf"): self.pump_i_buf.append(pump_i if pump_connected else None)
-            if hasattr(self, "pump_p_buf"): self.pump_p_buf.append(pump_p if pump_connected else None)
+            with self.history_lock:
+                self.t_buf.append(t_rel)
+                self.temp_buf.append(None if (temp_filt is None or not (temp_filt == temp_filt)) else float(temp_filt))
+                self.power_buf.append(p_out)
+                with self.params_lock:
+                    cur_target = float(self.params["target"])
+                self.target_buf.append(cur_target)
+                self.err_buf.append(None if not (err_phys == err_phys) else float(err_phys))
+                if hasattr(self, "pump_v_buf"): self.pump_v_buf.append(pump_v if pump_connected else None)
+                if hasattr(self, "pump_i_buf"): self.pump_i_buf.append(pump_i if pump_connected else None)
+                if hasattr(self, "pump_p_buf"): self.pump_p_buf.append(pump_p if pump_connected else None)
 
             if self.csv_writer:
                 try:
@@ -2991,8 +3113,9 @@ class App:
         self.acc_info.set(f"窗={win:.0f} s，容差=±{tol:.2f} °C")
         self.cur_err.set(fmt3(rt.get("err"), dash="0.000"))
 
-        t_list = list(self.t_buf)
-        e_list = list(self.err_buf)
+        with self.history_lock:
+            t_list = list(self.t_buf)
+            e_list = list(self.err_buf)
         if not t_list:
             self.mae_win.set("0.000");
             self.rmse_win.set("0.000");
@@ -3018,6 +3141,56 @@ class App:
             self.mae_win.set(f"{mae:.3f}")
             self.rmse_win.set(f"{rmse:.3f}")
             self.hit_ratio.set(f"{hit:.3f}")
+
+    def _compute_error_metrics(self, window_s=None):
+        if window_s is None:
+            try:
+                window_s = max(1.0, safe_float(self.acc_window_s.get(), 30.0) or 30.0)
+            except Exception:
+                window_s = 30.0
+
+        with self.history_lock:
+            t_list = list(self.t_buf)
+            e_list = list(self.err_buf)
+
+        if not t_list:
+            return {
+                "window": float(window_s),
+                "samples": 0,
+                "mae": None,
+                "rmse": None,
+                "hit_ratio": None,
+                "last_time": None,
+            }
+
+        t_now = t_list[-1]
+        t_min = t_now - window_s
+        errors = [e for t, e in zip(t_list, e_list) if t >= t_min and e is not None and not isnan(e)]
+        if not errors:
+            return {
+                "window": float(window_s),
+                "samples": 0,
+                "mae": None,
+                "rmse": None,
+                "hit_ratio": None,
+                "last_time": t_now,
+            }
+
+        mae = sum(abs(x) for x in errors) / len(errors)
+        rmse = sqrt(sum(x * x for x in errors) / len(errors))
+        try:
+            tol = max(0.0, safe_float(self.acc_tol.get(), 0.5) or 0.5)
+        except Exception:
+            tol = 0.5
+        hit = sum(1 for x in errors if abs(x) <= tol) / len(errors) * 100.0
+        return {
+            "window": float(window_s),
+            "samples": len(errors),
+            "mae": mae,
+            "rmse": rmse,
+            "hit_ratio": hit,
+            "last_time": t_now,
+        }
 
     def _update_plot(self):
         try:
@@ -3075,7 +3248,8 @@ class App:
             win_s = max(10.0, safe_float(self.plot_window_s.get(), 120.0) or 120.0)
 
             # 缓冲 -> 列表
-            t_all = list(self.t_buf)
+            with self.history_lock:
+                t_all = list(self.t_buf)
             yT_all = list(self.temp_buf)
             yHeP_all = list(self.power_buf)
             yTar_all = list(self.target_buf)
@@ -3230,14 +3404,15 @@ class App:
                 pass
 
     def _clear_plot(self):
-        self.t_buf.clear();
-        self.temp_buf.clear();
-        self.power_buf.clear()
-        self.err_buf.clear();
-        self.target_buf.clear()
-        if hasattr(self, "pump_v_buf"): self.pump_v_buf.clear()
-        if hasattr(self, "pump_i_buf"): self.pump_i_buf.clear()
-        if hasattr(self, "pump_p_buf"): self.pump_p_buf.clear()
+        with self.history_lock:
+            self.t_buf.clear();
+            self.temp_buf.clear();
+            self.power_buf.clear()
+            self.err_buf.clear();
+            self.target_buf.clear()
+            if hasattr(self, "pump_v_buf"): self.pump_v_buf.clear()
+            if hasattr(self, "pump_i_buf"): self.pump_i_buf.clear()
+            if hasattr(self, "pump_p_buf"): self.pump_p_buf.clear()
 
         self.line_temp.set_data([], [])
         self.line_power.set_data([], [])
@@ -3310,12 +3485,8 @@ class App:
             "slope_start_thr_cpm": self.slope_start_thr_cpm.get(),
             "slope_stop_thr_cpm": self.slope_stop_thr_cpm.get(),
 
-            "auto_click_enable": bool(self.auto_click_enable.get()),
-            "auto_click_x": s2i(self.auto_click_x, 0),
-            "auto_click_y": s2i(self.auto_click_y, 0),
-            "auto_click_button": self.auto_click_button.get(),
-            "auto_click_double": bool(self.auto_click_double.get()),
-            "auto_click_delay_ms": s2i(self.auto_click_delay_ms, 0),
+            "sim_click_enabled": bool(self.sim_click_enabled.get()),
+            "sim_click_pos": list(self.sim_click_pos) if self.sim_click_pos else None,
 
             # === 新增：循环泵持久化 ===
             "pump_port": sval(self.pump_port),
@@ -3402,13 +3573,22 @@ class App:
             self.slope_start_thr_cpm.set(cfg.get("slope_start_thr_cpm", self.slope_start_thr_cpm.get()))
             self.slope_stop_thr_cpm.set(cfg.get("slope_stop_thr_cpm", self.slope_stop_thr_cpm.get()))
 
-            self.auto_click_enable.set(cfg.get("auto_click_enable", self.auto_click_enable.get()))
-            self.auto_click_x.set(str(cfg.get("auto_click_x", int(self.auto_click_x.get() or "0"))))
-            self.auto_click_y.set(str(cfg.get("auto_click_y", int(self.auto_click_y.get() or "0"))))
-            self.auto_click_button.set(cfg.get("auto_click_button", self.auto_click_button.get()))
-            self.auto_click_double.set(cfg.get("auto_click_double", self.auto_click_double.get()))
-            self.auto_click_delay_ms.set(
-                str(cfg.get("auto_click_delay_ms", int(self.auto_click_delay_ms.get() or "0"))))
+            try:
+                self.sim_click_enabled.set(cfg.get("sim_click_enabled", self.sim_click_enabled.get()))
+            except Exception:
+                pass
+            sim_pos = cfg.get("sim_click_pos")
+            if isinstance(sim_pos, (list, tuple)) and len(sim_pos) == 2:
+                try:
+                    x, y = int(sim_pos[0]), int(sim_pos[1])
+                    self.sim_click_pos = (x, y)
+                    self.sim_click_label.set(f"{x}, {y}")
+                except Exception:
+                    self.sim_click_pos = None
+                    self.sim_click_label.set("未设置")
+            else:
+                self.sim_click_pos = None
+                self.sim_click_label.set("未设置")
 
             # —— PWM 相关 ——
             self.pump_pwm_enable.set(cfg.get("pump_pwm_enable", self.pump_pwm_enable.get()))
@@ -3461,7 +3641,6 @@ class App:
             with self.params_lock:
                 self.params["target"] = self._last_valid_target
 
-            self._sync_click_vars_to_entries()
         except Exception:
             pass
 
@@ -3469,36 +3648,6 @@ class App:
     def cleanup(self):
         """退出清理：安全收尾线程、热键、CSV 与设备。"""
         try:
-            # —— 坐标拾取与 Enter 解绑 ——
-            try:
-                if getattr(self, "_pick_running", False) and hasattr(self, "_stop_pick_coord"):
-                    self._stop_pick_coord()
-            except Exception:
-                pass
-
-            # 兜底：全局 Enter 热键与 Tk 的 <Return>
-            try:
-                if 'keyboard' in globals() and keyboard:
-                    if getattr(self, "_kb_enter_id", None) is not None:
-                        try:
-                            keyboard.remove_hotkey(self._kb_enter_id)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            try:
-                if getattr(self, "_tk_enter_bound", False):
-                    self.root.unbind_all('<Return>')
-            except Exception:
-                pass
-            # 清理标志位
-            try:
-                self._kb_enter_id = None
-                self._tk_enter_bound = False
-                self._pick_running = False
-            except Exception:
-                pass
-
             # —— 停止线性程序（含线程 join 与 CSV 收尾）——
             try:
                 if hasattr(self, "_stop_ramp"):
@@ -3545,298 +3694,80 @@ class App:
                 self._save_config()
             except Exception:
                 pass
-
-    def _start_pick_coord_enter(self):
-        """
-        开始坐标拾取（按 Enter 确认）：
-        - keyboard 可用则全局热键；
-        - 否则用 Tk 的 bind_all（无论焦点在哪个控件都能触发）。
-        """
-        if getattr(self, "_pick_running", False):
-            return
-
-        self._pick_running = True
-        self._set_status("坐标拾取中：把鼠标移到目标处，按 Enter 确认。")
-
-        # 清理旧的绑定
-        try:
-            if getattr(self, "_tk_enter_bound", False):
-                self.root.unbind_all('<Return>')
-        except Exception:
-            pass
-        self._tk_enter_bound = False
-
-        # keyboard 优先（打包成 exe 时多半不可用）
-        self._kb_enter_id = None
-        if 'keyboard' in globals() and keyboard:
             try:
-                self._kb_enter_id = keyboard.add_hotkey('enter', lambda: self._finish_pick_coord())
-            except Exception:
-                self._kb_enter_id = None
-
-        # 退回到 Tk：用 bind_all，确保在任何控件焦点下都响应
-        if self._kb_enter_id is None:
-            self.root.bind_all('<Return>', self._on_return_pick)
-            self._tk_enter_bound = True
-            try:
-                self.root.focus_force()
+                if getattr(self, "tcp_server", None):
+                    self.tcp_server.stop()
             except Exception:
                 pass
 
-        # 开启实时坐标预览
-        self._update_pick_preview()
+    def set_sim_click_point(self):
+        messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
 
-    def _on_return_pick(self, event=None):
-        """Tk 的 <Return> 回调：完成坐标拾取。"""
-        try:
-            self._finish_pick_coord()
-        finally:
-            return "break"
+        top = tk.Toplevel(self.root)
+        top.title("请切换到目标点，按Enter记录")
+        top.geometry("300x100")
+        top.attributes("-topmost", True)
 
-    def _stop_pick_coord(self):
-        """手动停止拾取（不写入坐标），解绑热键/事件。"""
-        try:
-            if 'keyboard' in globals() and keyboard and getattr(self, "_kb_enter_id", None) is not None:
-                keyboard.remove_hotkey(self._kb_enter_id)
-        except Exception:
-            pass
-        self._kb_enter_id = None
+        label = tk.Label(top, text="移动鼠标到目标点，然后按Enter")
+        label.pack(pady=20)
 
-        try:
-            if getattr(self, "_tk_enter_bound", False):
-                self.root.unbind_all('<Return>')
-        except Exception:
-            pass
-        self._tk_enter_bound = False
-
-        self._pick_running = False
-        self._set_status("已停止坐标拾取")
-
-    def _finish_pick_coord(self):
-        """结束拾取并写入 X/Y（由 Enter 触发）。"""
-        # —— 解绑 Enter（keyboard / Tk）——
-        try:
-            if 'keyboard' in globals() and keyboard and getattr(self, "_kb_enter_id", None) is not None:
-                try:
-                    keyboard.remove_hotkey(self._kb_enter_id)
-                finally:
-                    self._kb_enter_id = None
-        except Exception:
-            pass
-        try:
-            if getattr(self, "_tk_enter_bound", False):
-                self.root.unbind_all('<Return>')
-        except Exception:
-            pass
-        self._tk_enter_bound = False
-        self._pick_running = False
-
-        # —— 读取坐标 ——
-        try:
-            x, y = self._get_cursor_pos()
-        except Exception as e:
-            self._set_status(f"取坐标失败：{e}")
-            return
-
-        # —— 变量与 Entry 双路同步（防重复定义导致的“绑定丢失”）——
-        try:
-            self.auto_click_x.set(int(x))
-            self.auto_click_y.set(int(y))
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "ent_auto_x"):
-                self.ent_auto_x.delete(0, "end");
-                self.ent_auto_x.insert(0, str(int(x)))
-            if hasattr(self, "ent_auto_y"):
-                self.ent_auto_y.delete(0, "end");
-                self.ent_auto_y.insert(0, str(int(y)))
-        except Exception:
-            pass
-
-        # 自动勾选启用，避免“看见坐标但没启用”
-        try:
-            self.auto_click_enable.set(True)
-        except Exception:
-            pass
-
-        # 预览与状态
-        self.pick_preview.set(f"X={int(x)}, Y={int(y)}")
-        self._set_status(f"已记录坐标：({int(x)},{int(y)})，已启用自动点击")
-
-    def _simulate_click(self, x: int, y: int, button: str = "left", double: bool = False, delay_ms: int = 0):
-        """非阻塞模拟点击：后台线程执行点击；UI 更新回主线程。"""
-        # 最终再做一次坐标保护
-        if not self._coords_ok(int(x), int(y)):
-            self._set_status("模拟点击被取消：坐标无效。")
-            return
-
-        def _do_click_bg():
-            try:
-                # 可选延时
-                if delay_ms and delay_ms > 0:
-                    _time.sleep(delay_ms / 1000.0)
-
-                # 执行点击（优先 pyautogui）
-                if pyautogui is not None:
-                    clicks = 2 if double else 1
-                    btn = button.lower().strip()
-                    if btn not in ("left", "right", "middle"):
-                        btn = "left"
-                    pyautogui.click(x=int(x), y=int(y), clicks=clicks, button=btn)
-                else:
-                    if not sys.platform.startswith("win"):
-                        raise RuntimeError("缺少 pyautogui 且非 Windows，无法模拟点击。")
-                    user32 = ctypes.windll.user32
-                    user32.SetCursorPos(int(x), int(y))
-                    MOUSEEVENTF_LEFTDOWN = 0x0002;
-                    MOUSEEVENTF_LEFTUP = 0x0004
-                    MOUSEEVENTF_RIGHTDOWN = 0x0008;
-                    MOUSEEVENTF_RIGHTUP = 0x0010
-                    MOUSEEVENTF_MIDDLEDOWN = 0x0020;
-                    MOUSEEVENTF_MIDDLEUP = 0x0040
-                    btn = button.lower().strip()
-                    if btn == "right":
-                        down, up = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
-                    elif btn == "middle":
-                        down, up = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-                    else:
-                        down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
-                    user32.mouse_event(down, 0, 0, 0, 0)
-                    user32.mouse_event(up, 0, 0, 0, 0)
-                    if double:
-                        _time.sleep(0.03)
-                        user32.mouse_event(down, 0, 0, 0, 0)
-                        user32.mouse_event(up, 0, 0, 0, 0)
-
-                # 成功：回主线程更新状态
-                self._set_status(f"已模拟点击：({int(x)},{int(y)}) {button}{' 双击' if double else ''}")
-            except Exception as e:
-                self._set_status(f"模拟点击失败：{e}")
-
-        # 后台线程执行，确保 UI 不被阻塞
-        th = threading.Thread(target=_do_click_bg, daemon=True)
-        th.start()
-
-    def _try_auto_click_start(self):
-        """在线性段开始（斜率跨阈）时尝试点击；无效坐标则跳过并自动关闭该功能。"""
-        try:
-            if not bool(self.auto_click_enable.get()):
+        def on_enter(event=None):
+            if pyautogui is None:
+                self._set_status("模拟点击失败：缺少 pyautogui")
+                top.destroy()
                 return
-        except Exception:
-            return
-
-        # 解析坐标（空值会变成 0）；这里做严格校验
-        try:
-            x = int(self.auto_click_x.get() or 0)
-            y = int(self.auto_click_y.get() or 0)
-        except Exception:
-            x, y = 0, 0
-
-        if not self._coords_ok(x, y):
-            # 自动关闭，避免下次再触发
             try:
-                self.auto_click_enable.set(False)
+                pos = pyautogui.position()
+                x, y = int(pos[0]), int(pos[1])
+            except Exception as exc:
+                self._set_status(f"记录模拟点击点失败：{exc}")
+                top.destroy()
+                return
+            self.sim_click_pos = (x, y)
+            self.sim_click_label.set(f"{x}, {y}")
+            self._set_status(f"已记录模拟点击点：({x},{y})")
+            try:
+                self.sim_click_enabled.set(True)
             except Exception:
                 pass
-            self._set_status("自动点击已跳过：未选择有效坐标（已自动关闭）。")
+            top.destroy()
+
+        top.bind('<Return>', on_enter)
+        top.grab_set()
+        top.focus_set()
+        top.wait_window()
+
+    def perform_sim_click(self):
+        if pyautogui is None:
+            self._set_status("模拟点击失败：缺少 pyautogui")
             return
-
-        # 同一段只点一次
-        if getattr(self, "_auto_click_done_this_ramp", False):
+        if not self.sim_click_pos:
+            self._set_status("模拟点击点未设置，跳过点击")
             return
-        self._auto_click_done_this_ramp = True
-
-        btn = str(self.auto_click_button.get()).strip().lower()
-        dbl = bool(self.auto_click_double.get())
+        x, y = self.sim_click_pos
         try:
-            dly = int(self.auto_click_delay_ms.get() or 0)
+            pyautogui.click(x, y)
+            self._set_status(f"已模拟点击：({x},{y})")
+        except Exception as exc:
+            self._set_status(f"模拟点击失败：{exc}")
+
+    def maybe_sim_click(self):
+        try:
+            enabled = bool(self.sim_click_enabled.get())
         except Exception:
-            dly = 0
-
-        self._simulate_click(x, y, btn or "left", dbl, dly)
-
-    def _get_cursor_pos(self):
-        """返回全局屏幕坐标 (x, y)。优先 pyautogui；否则 Windows 用 ctypes 回退。"""
-        try:
-            if pyautogui is not None:
-                pos = pyautogui.position()
-                return int(pos[0]), int(pos[1])
-            if sys.platform.startswith("win"):
-                pt = _POINT()
-                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                return int(pt.x), int(pt.y)
-            raise RuntimeError("无法获取鼠标位置：缺少 pyautogui 且非 Windows 平台")
-        except Exception as e:
-            raise RuntimeError(f"获取鼠标位置失败：{e}")
-
-    def _screen_size(self):
-        """返回屏幕宽高 (w,h)。优先 Tk，Windows 退回 ctypes。"""
-        try:
-            w = int(self.root.winfo_screenwidth())
-            h = int(self.root.winfo_screenheight())
-            if w > 0 and h > 0:
-                return w, h
-        except Exception:
-            pass
-        try:
-            if sys.platform.startswith("win"):
-                user32 = ctypes.windll.user32
-                return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
-        except Exception:
-            pass
-        return 1920, 1080  # 兜底
-
-    def _coords_ok(self, x: int, y: int) -> bool:
-        """坐标有效性检查：非零、在屏幕内，且离边缘至少 2px。"""
-        try:
-            w, h = self._screen_size()
-            return (isinstance(x, int) and isinstance(y, int)
-                    and 2 <= x < w - 2 and 2 <= y < h - 2)
-        except Exception:
-            return False
-
-    def _update_pick_preview(self):
-        """拾取期间每 50ms 刷新一次预览坐标。"""
-        if not self._pick_running:
+            enabled = False
+        if not enabled:
             return
-        try:
-            x, y = self._get_cursor_pos()
-            self.pick_preview.set(f"X={x}, Y={y}")
-        except Exception:
-            pass
-        # 继续轮询
-        self.root.after(50, self._update_pick_preview)
-
-    def _start_pick_coord(self):
-        """
-        开始坐标拾取：
-        - 若安装了 keyboard：注册 F8 全局热键确认；
-        - 同时启动 50ms 预览刷新；可随时点“停止拾取”或再次按 F8 结束。
-        """
-        if self._pick_running:
-            return
-        self._pick_running = True
-        self._set_status("坐标拾取中：把鼠标移到目标处，按 F8 确认。（若 F8 不可用，请用“3秒后取点”）")
-
-        # 注册 F8 热键（可选）
-        self._kb_hotkey_id = None
-        if keyboard:
+        if not self.sim_click_pos:
+            self._set_status("模拟点击点未设置，已关闭模拟点击")
             try:
-                self._kb_hotkey_id = keyboard.add_hotkey('F8', lambda: self._finish_pick_coord())
+                self.sim_click_enabled.set(False)
             except Exception:
-                self._kb_hotkey_id = None
-
-        # 启动预览刷新
-        self._update_pick_preview()
-
-    def _pick_coord_in_3s(self):
-        """3秒后读取一次坐标（无需热键/依赖）。"""
-        if self._pick_running:
-            # 若当前在“开始拾取”模式中，先停止，避免冲突
-            self._stop_pick_coord()
-        self._set_status("3 秒后取坐标：请把鼠标移到目标位置…")
-        self.root.after(3000, self._finish_pick_coord)
+                pass
+            return
+        self._set_status("执行模拟点击…")
+        self.perform_sim_click()
+        self.perform_sim_click()
 
 # =========================
 # 入口
