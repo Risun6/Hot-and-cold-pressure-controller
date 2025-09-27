@@ -518,6 +518,8 @@ class MultiSequenceApp(ttk.Window):
         self.sim_click_enabled = tk.BooleanVar(value=False)
         self.sim_click_pos: Optional[tuple[int, int]] = None
         self.sim_click_label = tk.StringVar(value="未设置")
+        self.sim_click_check: Optional[ttk.Checkbutton] = None
+        self.sim_click_button: Optional[ttk.Button] = None
 
         self._build_ui()
 
@@ -568,11 +570,24 @@ class MultiSequenceApp(ttk.Window):
         click_box.pack(fill=tk.X, pady=6)
         click_row = ttk.Frame(click_box)
         click_row.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(click_row, text="开启模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=4)
-        ttk.Button(click_row, text="设置点击点", command=self.set_sim_click_point,
-                   bootstyle="outline-info").pack(side=tk.LEFT, padx=4)
+        self.sim_click_check = ttk.Checkbutton(click_row, text="开启模拟点击", variable=self.sim_click_enabled)
+        self.sim_click_check.pack(side=tk.LEFT, padx=4)
+        self.sim_click_button = ttk.Button(
+            click_row,
+            text="设置点击点",
+            command=self.set_sim_click_point,
+            bootstyle="outline-info",
+        )
+        self.sim_click_button.pack(side=tk.LEFT, padx=4)
         ttk.Label(click_row, textvariable=self.sim_click_label, width=18).pack(side=tk.LEFT, padx=4)
         ttk.Label(click_row, text="(窗口提示后按 Enter)").pack(side=tk.LEFT, padx=4)
+
+        if pyautogui is None:
+            if self.sim_click_check:
+                self.sim_click_check.configure(state=tk.DISABLED)
+            if self.sim_click_button:
+                self.sim_click_button.configure(state=tk.DISABLED)
+            self.sim_click_label.set("缺少 pyautogui")
 
         stability = ttk.Labelframe(main, text="判稳参数")
         stability.pack(fill=tk.X, pady=6)
@@ -676,6 +691,12 @@ class MultiSequenceApp(ttk.Window):
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc))
             return
+        if pyautogui is None and self.sim_click_enabled.get():
+            messagebox.showwarning("提示", "缺少 pyautogui，已关闭模拟点击。")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
         if self.sim_click_enabled.get() and not self.sim_click_pos:
             messagebox.showerror("错误", "请先设置模拟点击点")
             return
@@ -702,7 +723,12 @@ class MultiSequenceApp(ttk.Window):
     # Simulated click ------------------------------------------------
     def set_sim_click_point(self):
         if pyautogui is None:
-            messagebox.showerror("错误", "缺少 pyautogui，无法设置模拟点击点")
+            messagebox.showerror("缺少依赖", "需要安装 pyautogui 才能设置模拟点击点。")
+            self.log("模拟点击功能不可用：未安装 pyautogui")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
             return
         messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
 
@@ -737,7 +763,11 @@ class MultiSequenceApp(ttk.Window):
             self.log("模拟点击点未设置，跳过点击")
             return
         if pyautogui is None:
-            self.log("模拟点击失败：缺少 pyautogui")
+            self.log("模拟点击不可用：未安装 pyautogui")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
             return
         x, y = self.sim_click_pos
         try:
@@ -752,6 +782,13 @@ class MultiSequenceApp(ttk.Window):
         except Exception:
             enabled = False
         if not enabled:
+            return
+        if pyautogui is None:
+            logger("模拟点击不可用：未安装 pyautogui，已关闭模拟点击")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
             return
         if not self.sim_click_pos:
             logger("模拟点击点未设置，已关闭模拟点击")

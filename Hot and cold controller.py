@@ -3701,6 +3701,15 @@ class App:
                 pass
 
     def set_sim_click_point(self):
+        if pyautogui is None:
+            messagebox.showerror("缺少依赖", "需要安装 pyautogui 才能记录模拟点击点。")
+            self._set_status("模拟点击功能不可用：未安装 pyautogui")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
+            return
+
         messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
 
         top = tk.Toplevel(self.root)
@@ -3712,10 +3721,6 @@ class App:
         label.pack(pady=20)
 
         def on_enter(event=None):
-            if pyautogui is None:
-                self._set_status("模拟点击失败：缺少 pyautogui")
-                top.destroy()
-                return
             try:
                 pos = pyautogui.position()
                 x, y = int(pos[0]), int(pos[1])
@@ -3739,7 +3744,11 @@ class App:
 
     def perform_sim_click(self):
         if pyautogui is None:
-            self._set_status("模拟点击失败：缺少 pyautogui")
+            self._set_status("模拟点击不可用：未安装 pyautogui")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
             return
         if not self.sim_click_pos:
             self._set_status("模拟点击点未设置，跳过点击")
@@ -3757,6 +3766,13 @@ class App:
         except Exception:
             enabled = False
         if not enabled:
+            return
+        if pyautogui is None:
+            self._set_status("模拟点击不可用：未安装 pyautogui，已关闭模拟点击")
+            try:
+                self.sim_click_enabled.set(False)
+            except Exception:
+                pass
             return
         if not self.sim_click_pos:
             self._set_status("模拟点击点未设置，已关闭模拟点击")
