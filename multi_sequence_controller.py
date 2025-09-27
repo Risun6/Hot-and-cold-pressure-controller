@@ -9,7 +9,11 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, scrolledtext
 
-import pyautogui
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+except Exception:
+    pyautogui = None
 
 from tcp_utils import JSONLineClient
 
@@ -242,6 +246,8 @@ class SequenceRunner(threading.Thread):
                 self._run_matrix(temp_client, pressure_client)
             else:
                 self._run_ramp(temp_client, pressure_client)
+        except Exception as exc:
+            self.log(f"执行测试计划时出现异常: {exc}")
         finally:
             try:
                 pressure_client.stop_all()
@@ -314,6 +320,11 @@ class SequenceRunner(threading.Thread):
                         break
                     self._record_result(temp, pressure, t_status, p_status)
 
+        if self.stop_event.is_set():
+            self.log("矩阵测试已被停止")
+        else:
+            self.log("矩阵测试完成")
+
     # Ramp mode -------------------------------------------------------
     def _run_ramp(self, temp_client: ControllerClient, pressure_client: ControllerClient):
         pressures = self.plan["pressures"]
@@ -349,6 +360,11 @@ class SequenceRunner(threading.Thread):
                 p_thr,
                 p_hold,
             )
+
+        if self.stop_event.is_set():
+            self.log("变温测试已被停止")
+        else:
+            self.log("变温测试完成")
 
     def _wait_ramp_finish(self, temp_client: ControllerClient) -> bool:
         while not self.stop_event.is_set():

@@ -19,7 +19,11 @@ import openpyxl
 from collections import deque
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image, ImageChops
-import pyautogui
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+except Exception:
+    pyautogui = None
 import atexit, signal
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
@@ -960,6 +964,11 @@ class App(ttk.Window):
             self.after(500, lambda: self.set_indicator_color("red"))
 
     def set_sim_click_point(self):
+        if pyautogui is None:
+            messagebox.showerror("缺少依赖", "需要安装 pyautogui 才能记录模拟点击点。")
+            self.log("模拟点击功能不可用：未安装 pyautogui")
+            return
+
         messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
 
         top = tk.Toplevel(self)
@@ -970,7 +979,12 @@ class App(ttk.Window):
         label.pack(pady=20)
 
         def on_enter(event=None):
-            pos = pyautogui.position()
+            try:
+                pos = pyautogui.position()
+            except Exception as exc:
+                self.log(f"读取鼠标位置失败: {exc}")
+                top.destroy()
+                return
             self.sim_click_pos = pos
             self.log(f"已记录模拟点击点: {pos}")
             top.destroy()
@@ -981,6 +995,11 @@ class App(ttk.Window):
         top.wait_window()
 
     def set_pixel_detection_region(self):
+        if pyautogui is None:
+            messagebox.showerror("缺少依赖", "需要安装 pyautogui 才能设置检测区域。")
+            self.log("像素检测不可用：未安装 pyautogui")
+            return
+
         messagebox.showinfo("设置检测区域", "请用鼠标框选需要检测的屏幕区域，按 Enter 键确认。")
         overlay = tk.Toplevel(self)
         overlay.attributes("-fullscreen", True)
@@ -1062,6 +1081,10 @@ class App(ttk.Window):
         overlay.bind("<Return>", on_enter)
 
     def wait_for_pixel_change(self, timeout: float, interval: float) -> bool:
+        if pyautogui is None:
+            self.log("像素检测不可用：未安装 pyautogui")
+            return False
+
         if not self.pixel_detection_region or self.initial_pixel_snapshot is None:
             return False
 
@@ -1081,6 +1104,9 @@ class App(ttk.Window):
         return False
 
     def check_pixel_change(self):
+        if pyautogui is None:
+            return False, "缺少 pyautogui，无需检测"
+
         if not self.pixel_detection_region:
             return False, "检测区域未设置"
         try:
@@ -1195,14 +1221,21 @@ class App(ttk.Window):
                     time.sleep(0.10)
 
                     if self.sim_click_enabled.get():
-                        self.log("执行模拟点击…")
-                        self.perform_sim_click()
-                        self.perform_sim_click()
-                        try:
-                            self.initial_pixel_snapshot = pyautogui.screenshot(region=self.pixel_detection_region)
-                            self.log("已刷新基准快照")
-                        except Exception as e:
-                            self.log(f"刷新基准快照失败: {e}")
+                        if pyautogui is None:
+                            self.log("模拟点击已跳过：未安装 pyautogui")
+                            try:
+                                self.sim_click_enabled.set(False)
+                            except Exception:
+                                pass
+                        else:
+                            self.log("执行模拟点击…")
+                            self.perform_sim_click()
+                            self.perform_sim_click()
+                            try:
+                                self.initial_pixel_snapshot = pyautogui.screenshot(region=self.pixel_detection_region)
+                                self.log("已刷新基准快照")
+                            except Exception as e:
+                                self.log(f"刷新基准快照失败: {e}")
 
                         self.log("冻结 5 秒，开始倒计时…")
                         for remaining in range(5, 0, -1):
@@ -1211,7 +1244,14 @@ class App(ttk.Window):
                         self.log("倒计时结束，开始像素检测…")
 
                     if self.pixel_detection_enabled.get():
-                        self.log(f"开始像素检测 (超时 {pixel_timeout}s，间隔 {detection_interval}s)…")
+                        if pyautogui is None:
+                            self.log("像素检测已跳过：未安装 pyautogui")
+                            try:
+                                self.pixel_detection_enabled.set(False)
+                            except Exception:
+                                pass
+                        else:
+                            self.log(f"开始像素检测 (超时 {pixel_timeout}s，间隔 {detection_interval}s)…")
                         detected = self.wait_for_pixel_change(pixel_timeout, detection_interval)
                         if detected:
                             self.log(f"✅ {target}g：检测到像素变化，继续下一步")
@@ -3463,6 +3503,10 @@ class App(ttk.Window):
         self.sim_click_enabled.set(False)
 
     def perform_sim_click(self):
+        if pyautogui is None:
+            self.log("模拟点击不可用：未安装 pyautogui")
+            return
+
         if not self.sim_click_pos:
             self.log("模拟点击点未设置，跳过点击")
             return
