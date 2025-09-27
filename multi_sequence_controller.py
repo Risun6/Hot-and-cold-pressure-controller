@@ -2,12 +2,15 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, scrolledtext
+
+import pyautogui
+from PIL import ImageChops
 
 from tcp_utils import JSONLineClient
 
@@ -86,6 +89,7 @@ class SequenceRunner(threading.Thread):
         self.app = app
         self.plan = plan
         self.stop_event = threading.Event()
+        self.pixel_baseline = None
 
     def stop(self):
         self.stop_event.set()
@@ -285,7 +289,8 @@ class SequenceRunner(threading.Thread):
                     p_status = self.wait_pressure(pressure_client, p_thr, p_hold)
                     if p_status is None:
                         break
-                    self._record_result(temp, pressure, t_status, p_status)
+                    if not self._record_result(temp, pressure, t_status, p_status):
+                        return
         else:  # pressure first
             outer = pressures
             inner = temps
@@ -310,7 +315,8 @@ class SequenceRunner(threading.Thread):
                     p_status = self.wait_pressure(pressure_client, p_thr, p_hold)
                     if p_status is None:
                         break
-                    self._record_result(temp, pressure, t_status, p_status)
+                    if not self._record_result(temp, pressure, t_status, p_status):
+                        return
 
     # Ramp mode -------------------------------------------------------
     def _run_ramp(self, temp_client: ControllerClient, pressure_client: ControllerClient):
@@ -414,7 +420,10 @@ class SequenceRunner(threading.Thread):
                 p_status = self.wait_pressure(pressure_client, p_thr, p_hold)
                 if p_status is None:
                     break
-                self._record_result(final_status.get("target"), pressure, final_status, p_status)
+                if not self._record_result(
+                    final_status.get("target"), pressure, final_status, p_status
+                ):
+                    return
 
     def _run_ramp_temp_first(
         self,
@@ -457,9 +466,128 @@ class SequenceRunner(threading.Thread):
                 p_status = self.wait_pressure(pressure_client, p_thr, p_hold)
                 if p_status is None:
                     break
-                self._record_result(final_status.get("target"), pressure, final_status, p_status)
+                if not self._record_result(
+                    final_status.get("target"), pressure, final_status, p_status
+                ):
+                    return
 
-    def _record_result(self, temp, pressure, temp_status, press_status):
+    def _refresh_pixel_baseline(self) -> bool:
+        region = self.plan.get("pixel_detection_region")
+        if not region or len(region) != 4:
+            return False
+        try:
+            x, y, w, h = [int(v) for v in region]
+            if w <= 0 or h <= 0:
+                raise ValueError("invalid region size")
+            shot = pyautogui.screenshot(region=(x, y, w, h))
+            if shot.mode != "RGB":
+                shot = shot.convert("RGB")
+            self.pixel_baseline = shot
+            self.log(f"已刷新像素检测基准: 区域 {x},{y},{w},{h}")
+            return True
+        except Exception as exc:
+            self.log(f"刷新像素检测基准失败: {exc}")
+            return False
+
+    def _wait_for_pixel_change(self, timeout: float, interval: float, threshold: float) -> Tuple[bool, float]:
+        region = self.plan.get("pixel_detection_region")
+        if not region or len(region) != 4 or self.pixel_baseline is None:
+            return False, 0.0
+        x, y, w, h = [int(v) for v in region]
+        interval = max(0.05, float(interval))
+        threshold = max(0.0, float(threshold))
+        timeout = max(0.0, float(timeout))
+        start = time.time()
+        best_change = 0.0
+        while not self.stop_event.is_set() and (time.time() - start) <= timeout:
+            try:
+                shot = pyautogui.screenshot(region=(x, y, w, h))
+                if shot.mode != "RGB":
+                    shot = shot.convert("RGB")
+                diff = ImageChops.difference(self.pixel_baseline, shot)
+                diff_data = diff.getdata()
+                changed = sum(1 for px in diff_data if px != (0, 0, 0))
+                total = shot.width * shot.height
+                pct = (changed / total * 100.0) if total else 0.0
+                best_change = max(best_change, pct)
+                if pct >= threshold:
+                    self.pixel_baseline = shot
+                    return True, pct
+            except Exception as exc:
+                self.log(f"像素检测出现异常: {exc}")
+                break
+            time.sleep(interval)
+        return False, best_change
+
+    def _maybe_sim_click(self) -> bool:
+        if not self.plan.get("sim_click_enabled"):
+            return False
+        pos = self.plan.get("sim_click_pos")
+        if not pos or len(pos) != 2:
+            self.log("模拟点击已启用但未设置坐标，已自动关闭该功能")
+            self.plan["sim_click_enabled"] = False
+            return False
+        x, y = int(pos[0]), int(pos[1])
+        self.log("执行模拟点击…")
+        success = self.app.perform_sim_click((x, y))
+        if success:
+            time.sleep(0.05)
+            self.app.perform_sim_click((x, y))
+        return success
+
+    def _handle_post_stable_actions(self) -> bool:
+        detection_enabled = bool(self.plan.get("pixel_detection_enabled"))
+        region = self.plan.get("pixel_detection_region")
+        baseline_ready = False
+
+        if detection_enabled:
+            if not region or len(region) != 4:
+                self.log("像素检测已启用但未设置区域，已自动关闭该功能")
+                self.plan["pixel_detection_enabled"] = False
+                detection_enabled = False
+            else:
+                if not self._refresh_pixel_baseline():
+                    return False
+                baseline_ready = True
+
+        self._maybe_sim_click()
+
+        if not detection_enabled:
+            return True
+
+        if not baseline_ready and self.pixel_baseline is None:
+            if not self._refresh_pixel_baseline():
+                return False
+
+        delay = max(0.0, float(self.plan.get("pixel_post_click_delay", 0.15)))
+        if delay:
+            time.sleep(delay)
+
+        timeout = max(0.0, float(self.plan.get("pixel_timeout", 30.0)))
+        interval = max(0.05, float(self.plan.get("pixel_interval", 0.5)))
+        threshold = max(0.0, float(self.plan.get("pixel_threshold", 3.0)))
+
+        self.log(
+            f"等待像素变化：阈值 {threshold:.2f}%，超时 {timeout:.1f}s，间隔 {interval:.2f}s"
+        )
+
+        detected, pct = self._wait_for_pixel_change(timeout, interval, threshold)
+        if detected:
+            self.log(f"像素变化检测通过 ({pct:.2f}%)")
+            return True
+
+        if self.stop_event.is_set():
+            self.log("像素检测在终止请求时结束")
+        else:
+            self.log(f"像素检测未达到阈值 (最大 {pct:.2f}%)")
+        return False
+
+    def _record_result(self, temp, pressure, temp_status, press_status) -> bool:
+        if not self._handle_post_stable_actions():
+            if not self.stop_event.is_set():
+                self.log("后续联动操作失败，终止计划")
+            self.stop_event.set()
+            return False
         temp_value = temp if temp is not None else temp_status.get("temperature")
         pressure_value = pressure if pressure is not None else press_status.get("target")
         result = {
@@ -470,6 +598,7 @@ class SequenceRunner(threading.Thread):
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self.app.add_result(result)
+        return True
 
 
 class MultiSequenceApp(ttk.Window):
@@ -492,6 +621,17 @@ class MultiSequenceApp(ttk.Window):
         self.press_mae_var = tk.DoubleVar(value=50.0)
         self.press_hold_var = tk.DoubleVar(value=30.0)
         self.ramp_text = tk.StringVar(value="25,60,1.5,5\n60,20,1.0,3")
+
+        self.sim_click_enabled = tk.BooleanVar(value=False)
+        self.sim_click_pos = None
+        self.sim_click_label_var = tk.StringVar(value="坐标：未设置")
+        self.pixel_detection_enabled = tk.BooleanVar(value=False)
+        self.pixel_detection_region = None
+        self.pixel_region_label_var = tk.StringVar(value="区域：未设置")
+        self.pixel_threshold_var = tk.DoubleVar(value=3.0)
+        self.pixel_timeout_var = tk.DoubleVar(value=30.0)
+        self.pixel_interval_var = tk.DoubleVar(value=0.5)
+        self.pixel_post_click_delay_var = tk.DoubleVar(value=0.15)
 
         self.runner: Optional[SequenceRunner] = None
         self.results: List[dict] = []
@@ -563,6 +703,47 @@ class MultiSequenceApp(ttk.Window):
         self.ramp_box.pack(fill=tk.X, padx=4, pady=4)
         self.ramp_box.insert("1.0", self.ramp_text.get())
 
+        pixel_frame = ttk.Labelframe(main, text="像素变化检测")
+        pixel_frame.pack(fill=tk.X, pady=6)
+        pixel_row1 = ttk.Frame(pixel_frame)
+        pixel_row1.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(pixel_row1, text="启用像素检测", variable=self.pixel_detection_enabled).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(
+            pixel_row1,
+            text="设置检测区域",
+            command=self.set_pixel_detection_region,
+            bootstyle="outline-info",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Label(pixel_row1, textvariable=self.pixel_region_label_var).pack(side=tk.LEFT, padx=6)
+
+        pixel_row2 = ttk.Frame(pixel_frame)
+        pixel_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(pixel_row2, text="灵敏度阈值 (%)").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(pixel_row2, textvariable=self.pixel_threshold_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pixel_row2, text="超时 (s)").pack(side=tk.LEFT, padx=8)
+        ttk.Entry(pixel_row2, textvariable=self.pixel_timeout_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pixel_row2, text="检测间隔 (s)").pack(side=tk.LEFT, padx=8)
+        ttk.Entry(pixel_row2, textvariable=self.pixel_interval_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pixel_row2, text="点击后延时 (s)").pack(side=tk.LEFT, padx=8)
+        ttk.Entry(pixel_row2, textvariable=self.pixel_post_click_delay_var, width=8).pack(
+            side=tk.LEFT, padx=4
+        )
+
+        click_frame = ttk.Labelframe(main, text="模拟点击")
+        click_frame.pack(fill=tk.X, pady=6)
+        click_row = ttk.Frame(click_frame)
+        click_row.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(click_row, text="启用模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            click_row,
+            text="设置点击点",
+            command=self.set_sim_click_point,
+            bootstyle="outline-info",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Label(click_row, textvariable=self.sim_click_label_var).pack(side=tk.LEFT, padx=6)
+
         btns = ttk.Frame(main)
         btns.pack(fill=tk.X, pady=6)
         ttk.Button(btns, text="开始", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT, padx=4)
@@ -604,6 +785,133 @@ class MultiSequenceApp(ttk.Window):
             ramps.append(RampSegment(start, end, rate, hold))
         return ramps
 
+    def set_sim_click_point(self):
+        messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
+
+        top = tk.Toplevel(self)
+        top.title("请切换到目标点，按Enter记录")
+        top.geometry("320x110")
+
+        label = tk.Label(top, text="移动鼠标到目标点，然后按Enter")
+        label.pack(pady=20)
+
+        def on_enter(event=None):
+            try:
+                pos = pyautogui.position()
+            except Exception as exc:
+                messagebox.showerror("获取失败", f"无法获取鼠标位置: {exc}")
+                top.destroy()
+                return
+            self.sim_click_pos = (int(pos[0]), int(pos[1]))
+            self.sim_click_label_var.set(f"坐标：{self.sim_click_pos[0]}, {self.sim_click_pos[1]}")
+            self.log(f"已记录模拟点击点: {self.sim_click_pos}")
+            top.destroy()
+
+        top.bind('<Return>', on_enter)
+        top.grab_set()
+        top.focus_set()
+        top.wait_window()
+
+    def perform_sim_click(self, pos: Optional[tuple] = None) -> bool:
+        target = pos if pos is not None else self.sim_click_pos
+        if not target:
+            self.log("模拟点击点未设置，跳过点击")
+            return False
+        x, y = int(target[0]), int(target[1])
+        try:
+            pyautogui.click(x, y)
+            self.log(f"已模拟点击: ({x}, {y})")
+            return True
+        except Exception as exc:
+            self.log(f"执行模拟点击失败: {exc}")
+            return False
+
+    def set_pixel_detection_region(self):
+        messagebox.showinfo("设置检测区域", "请框选需要检测的屏幕区域，按 Enter 确认。")
+
+        overlay = tk.Toplevel(self)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-alpha", 0.3)
+        overlay.attributes("-topmost", True)
+        overlay.configure(background="gray")
+        overlay.grab_set()
+        overlay.focus_force()
+
+        canvas = tk.Canvas(overlay, cursor="cross", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.focus_set()
+
+        coords = {"x1": 0, "y1": 0, "x2": 0, "y2": 0, "rect": None}
+
+        def on_press(event):
+            coords["x1"], coords["y1"] = event.x, event.y
+            if coords["rect"]:
+                canvas.delete(coords["rect"])
+            coords["rect"] = canvas.create_rectangle(
+                coords["x1"], coords["y1"], event.x, event.y, outline="red", width=2
+            )
+
+        def on_drag(event):
+            if coords["rect"]:
+                canvas.coords(coords["rect"], coords["x1"], coords["y1"], event.x, event.y)
+
+        def on_release(event):
+            coords["x2"], coords["y2"] = event.x, event.y
+
+        def on_enter(event=None):
+            overlay.grab_release()
+            x1, y1 = coords["x1"], coords["y1"]
+            x2, y2 = coords["x2"], coords["y2"]
+            left, right = sorted((x1, x2))
+            top, bottom = sorted((y1, y2))
+            width = max(0, right - left)
+            height = max(0, bottom - top)
+            abs_x = overlay.winfo_rootx() + left
+            abs_y = overlay.winfo_rooty() + top
+
+            try:
+                if width <= 0 or height <= 0:
+                    raise ValueError("区域过小")
+
+                try:
+                    screen_w, screen_h = pyautogui.size()
+                except Exception:
+                    screen_w = screen_h = None
+
+                if screen_w is not None and screen_h is not None:
+                    abs_x = max(0, min(abs_x, screen_w - 1))
+                    abs_y = max(0, min(abs_y, screen_h - 1))
+                    width = min(width, max(0, screen_w - abs_x))
+                    height = min(height, max(0, screen_h - abs_y))
+                    if width <= 0 or height <= 0:
+                        raise ValueError("区域过小")
+
+                region = (int(abs_x), int(abs_y), int(width), int(height))
+                snapshot = pyautogui.screenshot(region=region)
+                if snapshot.mode != "RGB":
+                    snapshot = snapshot.convert("RGB")
+            except ValueError:
+                self.log("检测区域无效：选取的区域太小")
+                messagebox.showwarning("无效区域", "选取的检测区域太小，请重新尝试。")
+            except Exception as exc:
+                self.log(f"设置检测区域失败: {exc}")
+                messagebox.showerror("错误", f"无法截取屏幕区域: {exc}")
+            else:
+                self.pixel_detection_region = region
+                self.pixel_region_label_var.set(
+                    f"区域：{region[0]}, {region[1]}, {region[2]}, {region[3]}"
+                )
+                self.log(f"已设置像素检测区域: {region}")
+            finally:
+                overlay.destroy()
+            return "break"
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        overlay.bind("<Return>", on_enter)
+
+
     def build_plan(self):
         mode = self.mode_var.get()
         temps = self.parse_float_list(self.temps_var.get())
@@ -623,6 +931,16 @@ class MultiSequenceApp(ttk.Window):
             "press_hold": float(self.press_hold_var.get()),
             "test_type": self.test_type_var.get(),
             "ramps": ramps,
+            "sim_click_enabled": bool(self.sim_click_enabled.get()),
+            "sim_click_pos": tuple(self.sim_click_pos) if self.sim_click_pos else None,
+            "pixel_detection_enabled": bool(self.pixel_detection_enabled.get()),
+            "pixel_detection_region": tuple(self.pixel_detection_region)
+            if self.pixel_detection_region
+            else None,
+            "pixel_threshold": float(self.pixel_threshold_var.get()),
+            "pixel_timeout": float(self.pixel_timeout_var.get()),
+            "pixel_interval": float(self.pixel_interval_var.get()),
+            "pixel_post_click_delay": float(self.pixel_post_click_delay_var.get()),
         }
         if plan["test_type"] == "matrix":
             if not temps:
@@ -637,6 +955,12 @@ class MultiSequenceApp(ttk.Window):
     def start_plan(self):
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("提示", "任务正在运行")
+            return
+        if self.sim_click_enabled.get() and not self.sim_click_pos:
+            messagebox.showerror("错误", "请先设置模拟点击点")
+            return
+        if self.pixel_detection_enabled.get() and not self.pixel_detection_region:
+            messagebox.showerror("错误", "请先设置像素检测区域")
             return
         try:
             plan = self.build_plan()
