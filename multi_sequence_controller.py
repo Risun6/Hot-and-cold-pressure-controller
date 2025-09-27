@@ -9,6 +9,8 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, scrolledtext
 
+import pyautogui
+
 from tcp_utils import JSONLineClient
 
 TEMP_DEFAULT_HOST = "127.0.0.1"
@@ -459,7 +461,23 @@ class SequenceRunner(threading.Thread):
                     break
                 self._record_result(final_status.get("target"), pressure, final_status, p_status)
 
+    def _maybe_sim_click(self):
+        if not self.plan.get("sim_click_enabled"):
+            return
+        pos = self.plan.get("sim_click_pos")
+        if not pos or len(pos) != 2:
+            self.log("模拟点击已启用但未设置坐标，已自动关闭该功能")
+            self.plan["sim_click_enabled"] = False
+            return
+        x, y = int(pos[0]), int(pos[1])
+        self.log("执行模拟点击…")
+        success = self.app.perform_sim_click((x, y))
+        if success:
+            time.sleep(0.05)
+            self.app.perform_sim_click((x, y))
+
     def _record_result(self, temp, pressure, temp_status, press_status):
+        self._maybe_sim_click()
         temp_value = temp if temp is not None else temp_status.get("temperature")
         pressure_value = pressure if pressure is not None else press_status.get("target")
         result = {
@@ -492,6 +510,10 @@ class MultiSequenceApp(ttk.Window):
         self.press_mae_var = tk.DoubleVar(value=50.0)
         self.press_hold_var = tk.DoubleVar(value=30.0)
         self.ramp_text = tk.StringVar(value="25,60,1.5,5\n60,20,1.0,3")
+
+        self.sim_click_enabled = tk.BooleanVar(value=False)
+        self.sim_click_pos = None
+        self.sim_click_label_var = tk.StringVar(value="坐标：未设置")
 
         self.runner: Optional[SequenceRunner] = None
         self.results: List[dict] = []
@@ -563,6 +585,19 @@ class MultiSequenceApp(ttk.Window):
         self.ramp_box.pack(fill=tk.X, padx=4, pady=4)
         self.ramp_box.insert("1.0", self.ramp_text.get())
 
+        click_frame = ttk.Labelframe(main, text="模拟点击")
+        click_frame.pack(fill=tk.X, pady=6)
+        click_row = ttk.Frame(click_frame)
+        click_row.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(click_row, text="启用模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            click_row,
+            text="设置点击点",
+            command=self.set_sim_click_point,
+            bootstyle="outline-info",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Label(click_row, textvariable=self.sim_click_label_var).pack(side=tk.LEFT, padx=6)
+
         btns = ttk.Frame(main)
         btns.pack(fill=tk.X, pady=6)
         ttk.Button(btns, text="开始", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT, padx=4)
@@ -604,6 +639,47 @@ class MultiSequenceApp(ttk.Window):
             ramps.append(RampSegment(start, end, rate, hold))
         return ramps
 
+    def set_sim_click_point(self):
+        messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
+
+        top = tk.Toplevel(self)
+        top.title("请切换到目标点，按Enter记录")
+        top.geometry("320x110")
+
+        label = tk.Label(top, text="移动鼠标到目标点，然后按Enter")
+        label.pack(pady=20)
+
+        def on_enter(event=None):
+            try:
+                pos = pyautogui.position()
+            except Exception as exc:
+                messagebox.showerror("获取失败", f"无法获取鼠标位置: {exc}")
+                top.destroy()
+                return
+            self.sim_click_pos = (int(pos[0]), int(pos[1]))
+            self.sim_click_label_var.set(f"坐标：{self.sim_click_pos[0]}, {self.sim_click_pos[1]}")
+            self.log(f"已记录模拟点击点: {self.sim_click_pos}")
+            top.destroy()
+
+        top.bind('<Return>', on_enter)
+        top.grab_set()
+        top.focus_set()
+        top.wait_window()
+
+    def perform_sim_click(self, pos: Optional[tuple] = None) -> bool:
+        target = pos if pos is not None else self.sim_click_pos
+        if not target:
+            self.log("模拟点击点未设置，跳过点击")
+            return False
+        x, y = int(target[0]), int(target[1])
+        try:
+            pyautogui.click(x, y)
+            self.log(f"已模拟点击: ({x}, {y})")
+            return True
+        except Exception as exc:
+            self.log(f"执行模拟点击失败: {exc}")
+            return False
+
     def build_plan(self):
         mode = self.mode_var.get()
         temps = self.parse_float_list(self.temps_var.get())
@@ -623,6 +699,8 @@ class MultiSequenceApp(ttk.Window):
             "press_hold": float(self.press_hold_var.get()),
             "test_type": self.test_type_var.get(),
             "ramps": ramps,
+            "sim_click_enabled": bool(self.sim_click_enabled.get()),
+            "sim_click_pos": tuple(self.sim_click_pos) if self.sim_click_pos else None,
         }
         if plan["test_type"] == "matrix":
             if not temps:
@@ -637,6 +715,9 @@ class MultiSequenceApp(ttk.Window):
     def start_plan(self):
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("提示", "任务正在运行")
+            return
+        if self.sim_click_enabled.get() and not self.sim_click_pos:
+            messagebox.showerror("错误", "请先设置模拟点击点")
             return
         try:
             plan = self.build_plan()
