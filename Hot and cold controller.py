@@ -5,6 +5,7 @@ import csv
 import time
 import struct
 import serial
+import socket
 import threading
 from tkinter import filedialog
 from math import isnan, sqrt
@@ -17,6 +18,8 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox
 import serial.tools.list_ports
+
+from tcp_utils import JSONLineServer
 
 # ---- 可选依赖：鼠标/键盘 ----
 try:
@@ -62,6 +65,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 APP_NAME = "PID 冷热台控温（Modbus-RTU）"
 CONFIG_DIRNAME = "PID_冷热台"
 CONFIG_FILENAME = "config.json"
+
+TCP_HOST = "127.0.0.1"
+TCP_PORT = 50010
 
 PSU_BAUD = 9600   # 8N1
 TCM_BAUD = 57600  # 8N1
@@ -822,6 +828,7 @@ class App:
         # 缓冲与绘图
         self.history_seconds = 15 * 60
         maxlen = int(self.history_seconds * self.params["sample_hz"])
+        self.history_lock = threading.Lock()
         self.t_buf = deque(maxlen=maxlen)
         self.pump_v_buf = deque(maxlen=maxlen)
         self.pump_i_buf = deque(maxlen=maxlen)
@@ -965,6 +972,14 @@ class App:
         self._load_config()
         self._refresh_ports()
         self._schedule_gui_update()
+
+        # 启动 TCP 控制服务
+        self.tcp_server = JSONLineServer(TCP_HOST, TCP_PORT, self._handle_tcp_command, name="temp-controller")
+        try:
+            self.tcp_server.start()
+        except OSError as exc:
+            self.tcp_server = None
+            self._set_status(f"TCP服务启动失败: {exc}")
 
 
     # ---------- UI ----------
@@ -1774,21 +1789,20 @@ class App:
         没有足够点则返回 None。
         """
         try:
-            t_list = list(self.t_buf)
-            e_list = list(self.err_buf)
+            with self.history_lock:
+                t_list = list(self.t_buf)
+                e_list = list(self.err_buf)
             if not t_list or not e_list:
                 return None
             t_now = t_list[-1]
             t_min = t_now - max(1.0, float(window_s))
-            i0 = 0
-            for i in range(len(t_list) - 1, -1, -1):
-                if t_list[i] < t_min:
-                    i0 = i + 1
-                    break
-            ew = [e for e in e_list[i0:] if (e is not None and not isnan(e))]
-            if len(ew) < 5:
+            errors = [
+                e for t, e in zip(t_list, e_list)
+                if t >= t_min and e is not None and not isnan(e)
+            ]
+            if len(errors) < 5:
                 return None
-            return sum(abs(x) for x in ew) / len(ew)
+            return sum(abs(x) for x in errors) / len(errors)
         except Exception:
             return None
 
@@ -1922,6 +1936,33 @@ class App:
         except Exception:
             pass
 
+    def _tk_call_sync(self, fn, *args, **kwargs):
+        """在主线程同步执行函数并返回结果。"""
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args, **kwargs)
+
+        result = {}
+        event = threading.Event()
+
+        def wrapper():
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+            finally:
+                event.set()
+
+        try:
+            self.root.after(0, wrapper)
+            if not event.wait(timeout=3.0):
+                raise TimeoutError("UI thread unresponsive")
+        except Exception:
+            raise
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
     def _tk_set(self, tkvar, value):
         """线程安全地设置 Tk 变量."""
         self._tk_call(lambda v: tkvar.set(v), value)
@@ -2025,14 +2066,15 @@ class App:
         self.acq_running = False
         self._set_status("采集已停止")
 
-    def enable_pid(self, origin="user"):
+    def enable_pid(self, origin="user", notify=True):
         # 防抖，避免双击反复开文件
         if origin == "user" and not self._debounce("enable_pid"):
-            return
+            return False
 
         if not self.acq_running:
-            messagebox.showwarning("提示", "请先连接设备，采集会自动开始。")
-            return
+            if notify:
+                messagebox.showwarning("提示", "请先连接设备，采集会自动开始。")
+            return False
         try:
             # 同步参数
             self._sync_params_to_background()
@@ -2056,7 +2098,7 @@ class App:
             except Exception:
                 ok_temp = False
 
-            if not ok_temp:
+            if not ok_temp and notify:
                 messagebox.showwarning("提示", "温度仪暂未返回有效读数，将在采集循环中继续等待（不阻塞）。")
 
             # 打开输出并把当前设定电压明确写回（0 或上次值）
@@ -2081,8 +2123,12 @@ class App:
                 # 若 PID 已在运行，这里等价“切换新文件”，不会重置控制
                 self._csv_open_session("启动PID")
 
+            return True
+
         except Exception as e:
-            messagebox.showerror("错误", f"开启输出失败：\n{e}")
+            if notify:
+                messagebox.showerror("错误", f"开启输出失败：\n{e}")
+            return False
 
     def disable_pid(self):
         # 防抖
@@ -2129,31 +2175,34 @@ class App:
         self._save_config()
 
     # ---------- 线性程序 ----------
-    def _start_ramp(self):
+    def _start_ramp(self, origin="user", notify=True):
         if self.ramp_active:
-            messagebox.showinfo("提示", "线性程序已在运行。")
-            return
+            if notify:
+                messagebox.showinfo("提示", "线性程序已在运行。")
+            return False
         if not self.acq_running:
-            messagebox.showwarning("提示", "未在采集状态，无法执行线性程序。请先连接设备。")
-            return
+            if notify:
+                messagebox.showwarning("提示", "未在采集状态，无法执行线性程序。请先连接设备。")
+            return False
 
         # 防抖
-        if not self._debounce("start_ramp"):
-            return
+        if origin == "user" and not self._debounce("start_ramp"):
+            return False
 
         t0 = safe_float(self.ramp_start.get(), None)
         t1 = safe_float(self.ramp_end.get(), None)
         rate = safe_float(self.ramp_rate.get(), None)  # °C/min
         holdm = max(0.0, safe_float(self.ramp_hold_min.get(), 0.0) or 0.0)
         if None in (t0, t1, rate) or rate <= 0:
-            messagebox.showerror("错误", "请正确填写 起点/终点/速率(>0)。")
-            return
+            if notify:
+                messagebox.showerror("错误", "请正确填写 起点/终点/速率(>0)。")
+            return False
 
         # 若未启 PID，这里自动启（但标记为 ramp 来源，避免重复开 CSV）
         if not self.control_enabled:
-            self.enable_pid(origin="ramp")
+            self.enable_pid(origin="ramp", notify=notify)
             if not self.control_enabled:
-                return
+                return False
 
         # ★ 不在这里开CSV（等真正进入线性段时再开）
         with self.params_lock:
@@ -2171,6 +2220,7 @@ class App:
             daemon=True
         )
         self.ramp_thread.start()
+        return True
 
     def _ramp_worker(self, t0, t1, rate_c_per_min, hold_min, wait_to_start=True, loop=False):
         """
@@ -2346,6 +2396,131 @@ class App:
         self._set_status("线性程序已停止")
         # 停止线性程序 => 保存 CSV
         self._csv_close_session("停止线性程序")
+
+    # ---------- TCP 控制接口 ----------
+    def _handle_tcp_command(self, request):
+        cmd = str(request.get("cmd", "")).strip().lower()
+        if not cmd:
+            raise ValueError("missing cmd")
+
+        if cmd == "ping":
+            return {"timestamp": time.time()}
+
+        if cmd == "status":
+            return {"status": self.get_tcp_status()}
+
+        if cmd == "set_target":
+            if "value" not in request:
+                raise ValueError("missing value")
+            allow = bool(request.get("allow_ramp", False))
+            self.set_target_temperature(request["value"], allow_during_ramp=allow)
+            if request.get("start", False):
+                self.start_pid_remote()
+            return {"result": "target-updated"}
+
+        if cmd == "start_pid":
+            ok = self.start_pid_remote()
+            return {"result": ok}
+
+        if cmd == "stop_pid":
+            self.stop_pid_remote()
+            return {"result": True}
+
+        if cmd == "start_ramp":
+            params = request.get("params", {})
+            start = params.get("start", request.get("start"))
+            end = params.get("end", request.get("end"))
+            rate = params.get("rate", request.get("rate"))
+            if start is None or end is None or rate is None:
+                raise ValueError("start/end/rate required")
+            hold = params.get("hold", request.get("hold", 0.0))
+            loop = params.get("loop", request.get("loop", False))
+            ok = self.start_ramp_remote(start, end, rate, hold=hold, loop=loop)
+            return {"result": ok}
+
+        if cmd == "stop_ramp":
+            self.stop_ramp_remote()
+            return {"result": True}
+
+        raise ValueError(f"unknown cmd: {cmd}")
+
+    def get_tcp_status(self):
+        metrics = self._compute_error_metrics()
+        with self.rt_lock:
+            rt = dict(self.rt)
+        with self.params_lock:
+            target = float(self.params.get("target", 0.0))
+        try:
+            display_target = float(self.target_temp.get())
+            if display_target == display_target:
+                target = float(display_target)
+        except Exception:
+            pass
+
+        def _safe(value):
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if v != v:
+                return None
+            return v
+
+        status = {
+            "timestamp": time.time(),
+            "acq_running": bool(self.acq_running),
+            "pid_enabled": bool(self.control_enabled),
+            "ramp_active": bool(getattr(self, "ramp_active", False)),
+            "target": target,
+            "temperature": _safe(rt.get("temp")),
+            "voltage": _safe(rt.get("v_out")),
+            "current": _safe(rt.get("a_out")),
+            "power": _safe(rt.get("p_out")),
+            "error": _safe(rt.get("err")),
+            "mae": metrics.get("mae"),
+            "rmse": metrics.get("rmse"),
+            "hit_ratio": metrics.get("hit_ratio"),
+            "window": metrics.get("window"),
+            "samples": metrics.get("samples"),
+            "note": rt.get("note"),
+        }
+        if self._acq_t0 and metrics.get("last_time") is not None:
+            status["last_sample_ts"] = self._acq_t0 + metrics["last_time"]
+        return status
+
+    def set_target_temperature(self, value, allow_during_ramp=False):
+        value = float(value)
+        if value > TEMP_LIMIT_CUTOFF:
+            raise ValueError(f"目标温度 {value:.2f} 超过安全上限 {TEMP_LIMIT_CUTOFF:.1f}°C")
+        if not allow_during_ramp and getattr(self, "ramp_active", False):
+            raise RuntimeError("ramp active")
+        with self.params_lock:
+            self.params["target"] = float(value)
+        self._last_valid_target = float(value)
+        self._tk_set(self.target_temp, f"{float(value):.3f}")
+        return True
+
+    def start_pid_remote(self):
+        return self.enable_pid(origin="tcp", notify=False)
+
+    def stop_pid_remote(self):
+        self.disable_pid()
+        return True
+
+    def start_ramp_remote(self, start, end, rate, hold=0.0, loop=False):
+        def runner():
+            self.ramp_start.set(f"{float(start):.3f}")
+            self.ramp_end.set(f"{float(end):.3f}")
+            self.ramp_rate.set(f"{float(rate):.3f}")
+            self.ramp_hold_min.set(f"{float(max(0.0, hold)):.3f}")
+            self.ramp_cycle_enable.set(bool(loop))
+            return self._start_ramp(origin="tcp", notify=False)
+
+        return bool(self._tk_call_sync(runner))
+
+    def stop_ramp_remote(self):
+        self._tk_call(self._stop_ramp)
+        return True
 
     # ---------- Tk 参数同步 ----------
     def _sync_params_to_background(self):
@@ -2874,16 +3049,17 @@ class App:
                     "pump_vset": pvset_pub,  # 统一的“等效 Vset”
                 })
 
-            self.t_buf.append(t_rel)
-            self.temp_buf.append(None if (temp_filt is None or not (temp_filt == temp_filt)) else float(temp_filt))
-            self.power_buf.append(p_out)
-            with self.params_lock:
-                cur_target = float(self.params["target"])
-            self.target_buf.append(cur_target)
-            self.err_buf.append(None if not (err_phys == err_phys) else float(err_phys))
-            if hasattr(self, "pump_v_buf"): self.pump_v_buf.append(pump_v if pump_connected else None)
-            if hasattr(self, "pump_i_buf"): self.pump_i_buf.append(pump_i if pump_connected else None)
-            if hasattr(self, "pump_p_buf"): self.pump_p_buf.append(pump_p if pump_connected else None)
+            with self.history_lock:
+                self.t_buf.append(t_rel)
+                self.temp_buf.append(None if (temp_filt is None or not (temp_filt == temp_filt)) else float(temp_filt))
+                self.power_buf.append(p_out)
+                with self.params_lock:
+                    cur_target = float(self.params["target"])
+                self.target_buf.append(cur_target)
+                self.err_buf.append(None if not (err_phys == err_phys) else float(err_phys))
+                if hasattr(self, "pump_v_buf"): self.pump_v_buf.append(pump_v if pump_connected else None)
+                if hasattr(self, "pump_i_buf"): self.pump_i_buf.append(pump_i if pump_connected else None)
+                if hasattr(self, "pump_p_buf"): self.pump_p_buf.append(pump_p if pump_connected else None)
 
             if self.csv_writer:
                 try:
@@ -2991,8 +3167,9 @@ class App:
         self.acc_info.set(f"窗={win:.0f} s，容差=±{tol:.2f} °C")
         self.cur_err.set(fmt3(rt.get("err"), dash="0.000"))
 
-        t_list = list(self.t_buf)
-        e_list = list(self.err_buf)
+        with self.history_lock:
+            t_list = list(self.t_buf)
+            e_list = list(self.err_buf)
         if not t_list:
             self.mae_win.set("0.000");
             self.rmse_win.set("0.000");
@@ -3018,6 +3195,56 @@ class App:
             self.mae_win.set(f"{mae:.3f}")
             self.rmse_win.set(f"{rmse:.3f}")
             self.hit_ratio.set(f"{hit:.3f}")
+
+    def _compute_error_metrics(self, window_s=None):
+        if window_s is None:
+            try:
+                window_s = max(1.0, safe_float(self.acc_window_s.get(), 30.0) or 30.0)
+            except Exception:
+                window_s = 30.0
+
+        with self.history_lock:
+            t_list = list(self.t_buf)
+            e_list = list(self.err_buf)
+
+        if not t_list:
+            return {
+                "window": float(window_s),
+                "samples": 0,
+                "mae": None,
+                "rmse": None,
+                "hit_ratio": None,
+                "last_time": None,
+            }
+
+        t_now = t_list[-1]
+        t_min = t_now - window_s
+        errors = [e for t, e in zip(t_list, e_list) if t >= t_min and e is not None and not isnan(e)]
+        if not errors:
+            return {
+                "window": float(window_s),
+                "samples": 0,
+                "mae": None,
+                "rmse": None,
+                "hit_ratio": None,
+                "last_time": t_now,
+            }
+
+        mae = sum(abs(x) for x in errors) / len(errors)
+        rmse = sqrt(sum(x * x for x in errors) / len(errors))
+        try:
+            tol = max(0.0, safe_float(self.acc_tol.get(), 0.5) or 0.5)
+        except Exception:
+            tol = 0.5
+        hit = sum(1 for x in errors if abs(x) <= tol) / len(errors) * 100.0
+        return {
+            "window": float(window_s),
+            "samples": len(errors),
+            "mae": mae,
+            "rmse": rmse,
+            "hit_ratio": hit,
+            "last_time": t_now,
+        }
 
     def _update_plot(self):
         try:
@@ -3075,7 +3302,8 @@ class App:
             win_s = max(10.0, safe_float(self.plot_window_s.get(), 120.0) or 120.0)
 
             # 缓冲 -> 列表
-            t_all = list(self.t_buf)
+            with self.history_lock:
+                t_all = list(self.t_buf)
             yT_all = list(self.temp_buf)
             yHeP_all = list(self.power_buf)
             yTar_all = list(self.target_buf)
@@ -3230,14 +3458,15 @@ class App:
                 pass
 
     def _clear_plot(self):
-        self.t_buf.clear();
-        self.temp_buf.clear();
-        self.power_buf.clear()
-        self.err_buf.clear();
-        self.target_buf.clear()
-        if hasattr(self, "pump_v_buf"): self.pump_v_buf.clear()
-        if hasattr(self, "pump_i_buf"): self.pump_i_buf.clear()
-        if hasattr(self, "pump_p_buf"): self.pump_p_buf.clear()
+        with self.history_lock:
+            self.t_buf.clear();
+            self.temp_buf.clear();
+            self.power_buf.clear()
+            self.err_buf.clear();
+            self.target_buf.clear()
+            if hasattr(self, "pump_v_buf"): self.pump_v_buf.clear()
+            if hasattr(self, "pump_i_buf"): self.pump_i_buf.clear()
+            if hasattr(self, "pump_p_buf"): self.pump_p_buf.clear()
 
         self.line_temp.set_data([], [])
         self.line_power.set_data([], [])
@@ -3543,6 +3772,11 @@ class App:
             # —— 保存配置 ——
             try:
                 self._save_config()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "tcp_server", None):
+                    self.tcp_server.stop()
             except Exception:
                 pass
 
