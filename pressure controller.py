@@ -9,12 +9,14 @@ import time
 import struct
 import datetime
 import queue
+import math
 import matplotlib
 import numpy as np
 import os
 import json
 import csv
 import openpyxl
+from collections import deque
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image, ImageChops
 import pyautogui
@@ -22,6 +24,8 @@ import atexit, signal
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from tcp_utils import JSONLineServer
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -56,6 +60,10 @@ def calculate_crc(data: bytes) -> bytes:
             else:
                 crc >>= 1
     return struct.pack('<H', crc)
+
+
+TCP_HOST = "127.0.0.1"
+TCP_PORT = 50020
 
 
 class ModbusController:
@@ -276,6 +284,9 @@ class App(ttk.Window):
         self.time_data = []
         self.pos_data = []
         self.pressure_data = []
+        self._pressure_history_lock = threading.Lock()
+        self._pressure_history = deque()
+        self._history_max_seconds = 1800.0
         self.time_start = time.time()
         self.min_pressure = float('inf')
         self.max_pressure = float('-inf')
@@ -406,6 +417,13 @@ class App(ttk.Window):
         self._jump_pos_offsets = {}  # {idx: offset_mm}
         self.LOG_MAX_LINES = 200
 
+        self.tcp_server = JSONLineServer(TCP_HOST, TCP_PORT, self._handle_tcp_command, name="pressure-controller")
+        try:
+            self.tcp_server.start()
+        except OSError as exc:
+            self.tcp_server = None
+            self.log(f"TCP 服务启动失败: {exc}")
+
         atexit.register(self._cleanup_ports)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *a: self._cleanup_ports() or self.destroy())
@@ -428,6 +446,27 @@ class App(ttk.Window):
         menubar.add_cascade(label="帮助", menu=help_menu)
 
         self.config(menu=menubar)
+
+    def call_in_ui(self, fn, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args, **kwargs)
+        result = {}
+        event = threading.Event()
+
+        def wrapper():
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+            finally:
+                event.set()
+
+        self.after(0, wrapper)
+        if not event.wait(timeout=3.0):
+            raise TimeoutError("UI thread unresponsive")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
 
     def create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
@@ -1938,8 +1977,10 @@ class App(ttk.Window):
             try:
                 if self.modbus1:
                     pressure = self.read_pressure()
+                    ts = time.time()
                     self.current_pressure = pressure
-                    self.pressure_queue.put((time.time(), pressure))
+                    self.pressure_queue.put((ts, pressure))
+                    self._record_pressure_history(ts, pressure)
                     try:
                         safety_val = float(self.safety_pressure_var.get())
                     except Exception:
@@ -1956,6 +1997,116 @@ class App(ttk.Window):
                 self.log(f"压力数据读取错误: {e}")
             time.sleep(press_interval)
         self.log("压力线程已结束")
+
+    def _record_pressure_history(self, timestamp, pressure):
+        target = float(getattr(self, "target_pressure", 0.0))
+        with self._pressure_history_lock:
+            self._pressure_history.append((float(timestamp), float(pressure), target))
+            cutoff = float(timestamp) - float(self._history_max_seconds)
+            while self._pressure_history and self._pressure_history[0][0] < cutoff:
+                self._pressure_history.popleft()
+
+    def _compute_pressure_metrics(self, window_s=None):
+        if window_s is None:
+            window_s = 60.0
+        now = time.time()
+        cutoff = now - float(max(window_s, 1.0))
+        with self._pressure_history_lock:
+            samples = [item for item in self._pressure_history if item[0] >= cutoff]
+        if not samples:
+            return {
+                "window": float(window_s),
+                "samples": 0,
+                "mae": None,
+                "rmse": None,
+                "last": None,
+            }
+        errors = [p - t for _, p, t in samples]
+        mae = sum(abs(e) for e in errors) / len(errors)
+        rmse = math.sqrt(sum(e * e for e in errors) / len(errors))
+        last = samples[-1]
+        return {
+            "window": float(window_s),
+            "samples": len(samples),
+            "mae": mae,
+            "rmse": rmse,
+            "last": {
+                "timestamp": last[0],
+                "pressure": last[1],
+                "target": last[2],
+                "error": last[1] - last[2],
+            },
+        }
+
+    def _handle_tcp_command(self, request):
+        cmd = str(request.get("cmd", "")).strip().lower()
+        if not cmd:
+            raise ValueError("missing cmd")
+
+        if cmd == "ping":
+            return {"timestamp": time.time()}
+
+        if cmd == "status":
+            return {"status": self.get_tcp_status()}
+
+        if cmd == "set_target":
+            if "value" not in request:
+                raise ValueError("missing value")
+            self.set_target_pressure(request["value"])
+            if request.get("start", False):
+                self.start_pressure_remote()
+            return {"result": "target-updated"}
+
+        if cmd == "start_control":
+            ok = self.start_pressure_remote()
+            return {"result": ok}
+
+        if cmd == "stop_control":
+            self.stop_pressure_remote()
+            return {"result": True}
+
+        if cmd == "stop_all":
+            self.stop_all()
+            return {"result": True}
+
+        raise ValueError(f"unknown cmd: {cmd}")
+
+    def get_tcp_status(self):
+        metrics = self._compute_pressure_metrics()
+        status = {
+            "timestamp": time.time(),
+            "pressure": float(self.current_pressure),
+            "target": float(getattr(self, "target_pressure", 0.0)),
+            "running": bool(self.pressure_control_running),
+            "multi_pressure_running": bool(self.multi_pressure_running),
+            "mae": metrics.get("mae"),
+            "rmse": metrics.get("rmse"),
+            "window": metrics.get("window"),
+            "samples": metrics.get("samples"),
+            "last": metrics.get("last"),
+            "tolerance": float(getattr(self, "pressure_tolerance", 0.0)),
+        }
+        return status
+
+    def set_target_pressure(self, value):
+        value = float(value)
+
+        def setter():
+            self.target_pressure_var.set(value)
+
+        self.call_in_ui(setter)
+        self.target_pressure = value
+        return True
+
+    def start_pressure_remote(self):
+        def starter():
+            return self.start_pressure_control(notify=False)
+
+        return bool(self.call_in_ui(starter))
+
+    def stop_pressure_remote(self):
+        self.call_in_ui(self.stop_pressure_control)
+        return True
 
     def poll_position_data(self):
         self.position_thread_running = True
@@ -2005,6 +2156,7 @@ class App(ttk.Window):
                         pressure = self.read_pressure()
                         self.current_pressure = pressure
                         self.pressure_queue.put((now, pressure))
+                        self._record_pressure_history(now, pressure)
                         try:
                             safety_val = float(self.safety_pressure_var.get())
                         except Exception:
@@ -3012,29 +3164,33 @@ class App(ttk.Window):
                 self.press_interval_entry.delete(0, tk.END)
                 self.press_interval_entry.insert(0, str(self.MIN_INTERVAL))
 
-    def start_pressure_control(self):
+    def start_pressure_control(self, notify=True):
         try:
             self.target_pressure = float(self.target_pressure_var.get())
             self.pressure_tolerance = float(self.tolerance_var.get())
             self.high_speed = float(self.high_speed_var.get())
             self.low_speed = float(self.low_speed_var.get())
         except ValueError:
-            messagebox.showerror("错误", "请输入有效的数值")
-            return
+            if notify:
+                messagebox.showerror("错误", "请输入有效的数值")
+            return False
 
         if self.pressure_control_running:
-            self.log("压力控制已在运行中")
-            return
+            if notify:
+                self.log("压力控制已在运行中")
+            return False
 
         if self.high_speed > 0.5:
-            if not messagebox.askyesno("高速下压警告",
-                                       f"您即将以 {self.high_speed} mm/s 的速度下压，这可能导致设备损坏！\n是否继续？"):
-                return
+            if notify:
+                if not messagebox.askyesno("高速下压警告",
+                                           f"您即将以 {self.high_speed} mm/s 的速度下压，这可能导致设备损坏！\n是否继续？"):
+                    return False
 
         self.pressure_control_running = True
         self.log(f"开始压力控制: 目标压力={self.target_pressure}g, 容差={self.pressure_tolerance}g")
         self.pressure_control_thread = threading.Thread(target=self.pressure_control_loop, daemon=True)
         self.pressure_control_thread.start()
+        return True
 
     def stop_pressure_control(self):
         self.pressure_control_running = False
@@ -3192,6 +3348,12 @@ class App(ttk.Window):
             # 尽量先停控：避免关闭过程中又有新 I/O
             try:
                 self.stop_all()
+            except Exception:
+                pass
+
+            try:
+                if getattr(self, "tcp_server", None):
+                    self.tcp_server.stop()
             except Exception:
                 pass
 
