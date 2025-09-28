@@ -3224,7 +3224,9 @@ class App(ttk.Frame):
         if self.pressure_control_running:
             if notify:
                 self.log("压力控制已在运行中")
-            return False
+                return False
+            # 远程/静默调用视为幂等成功，避免重复启动时报错
+            return True
 
         if self.high_speed > 0.5:
             if notify:
