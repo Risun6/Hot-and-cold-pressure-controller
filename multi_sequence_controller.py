@@ -278,7 +278,7 @@ class SequenceRunner(threading.Thread):
             "col": col,
             "temperature": temperature,
             "current": current,
-            "pressure": current,
+            "pressure": current,  # 按原始字段保留
             "temp_status": temp_status,
             "pressure_status": pressure_status,
             "status": "completed",
@@ -379,30 +379,12 @@ class SequenceRunner(threading.Thread):
             self.app.after(0, self.app.on_runner_finished)
 
 
-class MultiSequenceApp(ttk.Frame):
-    def __init__(self, master: Optional[tk.Misc] = None) -> None:
-        if master is None:
-            window = ttk.Window(themename="cosmo")
-            master_widget: tk.Misc = window
-            self._owns_window = True
-        else:
-            master_widget = master
-            if isinstance(master, (tk.Tk, tk.Toplevel, ttk.Window)):
-                window = master  # type: ignore[assignment]
-            else:
-                window = master.winfo_toplevel()
-            self._owns_window = False
-
-        super().__init__(master_widget)
-        self.pack(fill=tk.BOTH, expand=True)
-
-        self._window = window
-        if hasattr(self._window, "title"):
-            self._window.title("冷热平台多点自动测试")
-        if hasattr(self._window, "geometry"):
-            self._window.geometry("960x720")
-        if hasattr(self._window, "protocol"):
-            self._window.protocol("WM_DELETE_WINDOW", self.on_close)
+class MultiSequenceApp(ttk.Window):
+    def __init__(self) -> None:
+        super().__init__(themename="cosmo")
+        self.title("冷热平台多点自动测试")
+        self.geometry("960x720")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.temperature_vars: List[tk.StringVar] = []
         self.current_vars: List[tk.StringVar] = []
@@ -692,9 +674,11 @@ class MultiSequenceApp(ttk.Frame):
     # Logging -------------------------------------------------------------
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
+
         def append() -> None:
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.log_text.see(tk.END)
+
         self.after(0, append)
 
     def add_result(self, result: Dict) -> None:
@@ -796,23 +780,17 @@ class MultiSequenceApp(ttk.Frame):
         self.press_error_var.set(self._fmt_value(error))
 
     # Shutdown ------------------------------------------------------------
-    def shutdown(self, destroy_window: Optional[bool] = None) -> None:
-        if destroy_window is None:
-            destroy_window = self._owns_window
+    def on_close(self) -> None:
         self.stop_plan()
         self._rt_stop.set()
         if self._rt_thread and self._rt_thread.is_alive():
-            self._rt_thread.join(timeout=1.0)
-        target = self._window if destroy_window else self
-        try:
-            target.destroy()
-        except Exception:
-            pass
-
-    def on_close(self) -> None:
-        self.shutdown(destroy_window=True)
+            try:
+                self._rt_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self.destroy()
 
 
 if __name__ == "__main__":
     app = MultiSequenceApp()
-    app._window.mainloop()
+    app.mainloop()
