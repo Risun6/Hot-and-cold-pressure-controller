@@ -278,7 +278,7 @@ class SequenceRunner(threading.Thread):
             "col": col,
             "temperature": temperature,
             "current": current,
-            "pressure": current,
+            "pressure": current,  # 按原始字段保留
             "temp_status": temp_status,
             "pressure_status": pressure_status,
             "status": "completed",
@@ -384,6 +384,7 @@ class MultiSequenceApp(ttk.Window):
         super().__init__(themename="cosmo")
         self.title("冷热平台多点自动测试")
         self.geometry("960x720")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.temperature_vars: List[tk.StringVar] = []
         self.current_vars: List[tk.StringVar] = []
@@ -409,8 +410,6 @@ class MultiSequenceApp(ttk.Window):
         self._rt_lock = threading.Lock()
         self._rt_latest: Optional[Tuple[Optional[Dict], Optional[Dict], float]] = None
         self._rt_thread: Optional[threading.Thread] = None
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_ui()
         self._init_default_matrix()
@@ -675,9 +674,11 @@ class MultiSequenceApp(ttk.Window):
     # Logging -------------------------------------------------------------
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
+
         def append() -> None:
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.log_text.see(tk.END)
+
         self.after(0, append)
 
     def add_result(self, result: Dict) -> None:
@@ -783,7 +784,10 @@ class MultiSequenceApp(ttk.Window):
         self.stop_plan()
         self._rt_stop.set()
         if self._rt_thread and self._rt_thread.is_alive():
-            self._rt_thread.join(timeout=1.0)
+            try:
+                self._rt_thread.join(timeout=1.0)
+            except Exception:
+                pass
         self.destroy()
 
 
