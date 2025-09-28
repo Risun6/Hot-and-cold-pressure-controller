@@ -247,18 +247,46 @@ class ModbusController:
 
 
 
-class App(ttk.Window):
-    def __init__(self):
-        super().__init__(themename="cosmo")
-        self.title("压力控制综合程序")
-        self.minsize(1600, 900)
-        self.geometry("1600x900")
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+class App(ttk.Frame):
+    def __init__(self, master=None):
+        if master is None:
+            window = ttk.Window(themename="cosmo")
+            master_widget = window
+            self._owns_window = True
+        else:
+            master_widget = master
+            if isinstance(master, (tk.Tk, tk.Toplevel, ttk.Window)):
+                window = master
+            else:
+                window = master.winfo_toplevel()
+            self._owns_window = False
 
-        try:
-            self.iconbitmap("icon.ico")
-        except:
-            pass
+        super().__init__(master_widget)
+        self.pack(fill=tk.BOTH, expand=True)
+
+        self._window = window
+        self._embedded = not self._owns_window
+
+        if self._owns_window:
+            try:
+                ttk.Style().theme_use("cosmo")
+            except Exception:
+                pass
+
+        if hasattr(self._window, "title"):
+            self._window.title("压力控制综合程序")
+        if hasattr(self._window, "minsize"):
+            self._window.minsize(1600, 900)
+        if hasattr(self._window, "geometry"):
+            self._window.geometry("1600x900")
+        if hasattr(self._window, "protocol"):
+            self._window.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        if self._owns_window:
+            try:
+                self._window.iconbitmap("icon.ico")
+            except Exception:
+                pass
 
         self.create_menu()
 
@@ -426,12 +454,31 @@ class App(ttk.Window):
 
         atexit.register(self._cleanup_ports)
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda *a: self._cleanup_ports() or self.destroy())
+            signal.signal(sig, lambda *a: self.shutdown())
 
     def create_menu(self):
-        menubar = Menu(self)
+        if self._embedded:
+            toolbar = ttk.Frame(self, padding=(0, 6))
+            toolbar.pack(fill=tk.X)
+            ttk.Button(toolbar, text="保存设置", command=self.save_config, bootstyle="secondary-outline").pack(
+                side=tk.LEFT, padx=4
+            )
+            ttk.Button(toolbar, text="加载设置", command=self.load_config, bootstyle="secondary-outline").pack(
+                side=tk.LEFT, padx=4
+            )
+            ttk.Button(toolbar, text="停止全部", command=self.stop_all, bootstyle="warning-outline").pack(
+                side=tk.LEFT, padx=12
+            )
+            ttk.Button(toolbar, text="使用说明", command=self.show_instructions, bootstyle="info-link").pack(
+                side=tk.RIGHT, padx=4
+            )
+            ttk.Button(toolbar, text="关于", command=self.show_about, bootstyle="info-link").pack(
+                side=tk.RIGHT, padx=4
+            )
+            return
 
-        # 文件
+        menubar = Menu(self._window)
+
         file_menu = Menu(menubar, tearoff=0)
         file_menu.add_command(label="保存设置", command=self.save_config)
         file_menu.add_command(label="加载设置", command=self.load_config)
@@ -439,13 +486,12 @@ class App(ttk.Window):
         file_menu.add_command(label="退出", command=self.on_closing)
         menubar.add_cascade(label="文件", menu=file_menu)
 
-        # 仅保留“帮助”，去掉“设置”“工具”
         help_menu = Menu(menubar, tearoff=0)
         help_menu.add_command(label="使用说明", command=self.show_instructions)
         help_menu.add_command(label="关于", command=self.show_about)
         menubar.add_cascade(label="帮助", menu=help_menu)
 
-        self.config(menu=menubar)
+        self._window.config(menu=menubar)
 
     def call_in_ui(self, fn, *args, **kwargs):
         if threading.current_thread() is threading.main_thread():
@@ -3337,15 +3383,17 @@ class App(ttk.Window):
                 btn.config(state=state)
         self.update_button_states()
 
-    def on_closing(self):
-        """窗口关闭回调：先停一切，再析构窗口，避免句柄遗留为“占用”状态。"""
+    def shutdown(self, destroy_window: bool | None = None):
+        """统一的关闭流程：可在嵌入/独立模式中复用。"""
+        if destroy_window is None:
+            destroy_window = self._owns_window
+
         try:
             try:
                 self.save_config()
             except Exception as e:
                 self.log(f"关闭前保存配置失败: {e}")
 
-            # 尽量先停控：避免关闭过程中又有新 I/O
             try:
                 self.stop_all()
             except Exception:
@@ -3359,10 +3407,14 @@ class App(ttk.Window):
 
             self._cleanup_ports()
         finally:
+            target = self._window if destroy_window else self
             try:
-                self.destroy()
+                target.destroy()
             except Exception:
                 pass
+
+    def on_closing(self):
+        self.shutdown(destroy_window=True)
 
     def change_pressure_unit(self, unit):
         from tkinter import Toplevel, Label, Entry, Button
@@ -4463,4 +4515,4 @@ class App(ttk.Window):
 
 if __name__ == "__main__":
     app = App()
-    app.mainloop()
+    app._window.mainloop()

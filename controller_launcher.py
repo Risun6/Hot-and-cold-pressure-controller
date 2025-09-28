@@ -1,115 +1,91 @@
-"""启动温控、压力控制与多序列调度界面的统一入口。
+"""统一的多程序启动器：以标签页形式承载温控、压力与多序列调度界面。"""
 
-运行本脚本会启动三个独立的子进程，每个子进程负责一个原有的
-Tk 图形界面程序。按 Ctrl+C 或关闭任意窗口时会自动清理剩余进程。
-"""
 from __future__ import annotations
 
-import os
-import signal
-import subprocess
+import importlib.util
 import sys
-import time
-from dataclasses import dataclass
+import tkinter as tk
 from pathlib import Path
-from typing import List, Optional
+from types import ModuleType
+
+import ttkbootstrap as ttk
 
 ROOT_DIR = Path(__file__).resolve().parent
 
 
-@dataclass
-class ManagedProcess:
-    name: str
-    path: Path
-    process: Optional[subprocess.Popen] = None
+def _load_module(module_name: str, file_name: str) -> ModuleType:
+    """加载带空格文件名的 GUI 模块，避免重复导入。"""
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, ROOT_DIR / file_name)
+    if spec is None or spec.loader is None:  # pragma: no cover - 极端情况
+        raise ImportError(f"无法加载模块 {file_name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
-    def launch(self) -> None:
-        if not self.path.exists():
-            raise FileNotFoundError(f"找不到 {self.name} 程序: {self.path}")
-        cmd = [sys.executable, str(self.path)]
-        env = os.environ.copy()
-        self.process = subprocess.Popen(cmd, cwd=str(self.path.parent), env=env)
 
-    def terminate(self, timeout: float = 3.0) -> None:
-        if not self.process:
-            return
-        proc = self.process
-        if proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
+temperature_module = _load_module("temperature_controller_app", "Hot and cold controller.py")
+pressure_module = _load_module("pressure_controller_app", "pressure controller.py")
+
+from multi_sequence_controller import MultiSequenceApp  # noqa: E402  # 该文件命名规范
+
+TemperatureApp = temperature_module.App  # type: ignore[attr-defined]
+PressureApp = pressure_module.App  # type: ignore[attr-defined]
+
+
+class UnifiedController(ttk.Window):
+    def __init__(self) -> None:
+        super().__init__(themename="cosmo")
+        self.title("冷热压力一体化控制台")
+        self.geometry("1720x980")
+
+        self.notebook = ttk.Notebook(self, padding=8)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        temp_tab = ttk.Frame(self.notebook)
+        press_tab = ttk.Frame(self.notebook)
+        seq_tab = ttk.Frame(self.notebook)
+
+        for tab, text in (
+            (temp_tab, "温度控制"),
+            (press_tab, "压力控制"),
+            (seq_tab, "多序列执行"),
+        ):
+            self.notebook.add(tab, text=text)
+
+        self.temperature_app = TemperatureApp(temp_tab)
+        self.pressure_app = PressureApp(press_tab)
+        self.sequence_app = MultiSequenceApp(seq_tab)
+
+        # 统一填充，使三个子界面都自适应可用空间
+        for child in (self.temperature_app.container, self.pressure_app, self.sequence_app):
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        finally:
-            self.process = None
-
-    def is_running(self) -> bool:
-        return bool(self.process) and self.process.poll() is None
-
-
-class Launcher:
-    def __init__(self):
-        self.apps: List[ManagedProcess] = [
-            ManagedProcess("温度控制", ROOT_DIR / "Hot and cold controller.py"),
-            ManagedProcess("压力控制", ROOT_DIR / "pressure controller.py"),
-            ManagedProcess("多序列调度", ROOT_DIR / "multi_sequence_controller.py"),
-        ]
-        self._register_signals()
-
-    def _register_signals(self) -> None:
-        def handler(signum, frame):  # noqa: ARG001 - 回调签名要求
-            print(f"\n收到信号 {signum}，准备退出…")
-            self.shutdown()
-            sys.exit(0)
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                signal.signal(sig, handler)
+                child.pack_configure(fill=tk.BOTH, expand=True)
             except Exception:
-                # 某些平台（如 Windows）不支持 SIGTERM
                 pass
 
-    def start_all(self) -> None:
-        for app in self.apps:
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        for cleanup in (
+            getattr(self.temperature_app, "cleanup", None),
+            lambda: self.pressure_app.shutdown(destroy_window=False),
+            lambda: self.sequence_app.shutdown(destroy_window=False),
+        ):
+            if cleanup is None:
+                continue
             try:
-                app.launch()
-            except Exception as exc:
-                print(f"× 无法启动 {app.name}: {exc}")
-            else:
-                print(f"✓ 已启动 {app.name} (PID={app.process.pid})")
-
-    def monitor(self) -> None:
-        try:
-            while True:
-                alive = [app for app in self.apps if app.is_running()]
-                if not alive:
-                    print("所有子程序已退出，主程序结束。")
-                    break
-                for app in list(self.apps):
-                    if app.process and app.process.poll() is not None:
-                        code = app.process.returncode
-                        status = "正常退出" if code == 0 else f"异常退出 (code={code})"
-                        print(f"- {app.name} {status}")
-                        app.process = None
-                time.sleep(1.0)
-        except KeyboardInterrupt:
-            print("\n收到键盘中断，正在关闭所有子程序…")
-        finally:
-            self.shutdown()
-
-    def shutdown(self) -> None:
-        for app in self.apps:
-            if app.is_running():
-                print(f"→ 关闭 {app.name}…")
-            app.terminate()
+                cleanup()
+            except Exception:
+                pass
+        self.destroy()
 
 
 def main() -> None:
-    launcher = Launcher()
-    launcher.start_all()
-    launcher.monitor()
+    app = UnifiedController()
+    app.mainloop()
 
 
 if __name__ == "__main__":
