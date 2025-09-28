@@ -727,11 +727,30 @@ def _stop_async_samplers(self):
 # 主应用（含显示三位小数、线性程序、拟合）
 # =========================
 class App:
-    def __init__(self, root):
+    def __init__(self, master=None):
+        if master is None:
+            root = ttk.Window(themename="cosmo")
+            self._owns_window = True
+        else:
+            root = master
+            self._owns_window = False
+
         self.root = root
-        self.style = ttk.Style("cosmo")
-        self.root.title(APP_NAME)
-        self.root.geometry("1320x860")
+        # 当在统一界面内嵌时，外层已经设置主题；独立运行时需要主动设置
+        try:
+            self.style = ttk.Style()
+            if self._owns_window:
+                self.style.theme_use("cosmo")
+        except Exception:
+            self.style = ttk.Style()
+
+        if hasattr(self.root, "title"):
+            self.root.title(APP_NAME)
+        if hasattr(self.root, "geometry"):
+            self.root.geometry("1320x860")
+
+        self.container = ttk.Frame(self.root)
+        self.container.pack(fill=tk.BOTH, expand=True)
 
         # 状态对象
         self.psu = PowerSupply()
@@ -993,7 +1012,7 @@ class App:
             ttk.Label(frame, textvariable=var, font=("Arial", 9)).pack(side=tk.LEFT)
             return cv
 
-        content = ttk.Frame(self.root)
+        content = ttk.Frame(self.container)
         content.pack(fill=tk.BOTH, expand=True)
 
         # 左侧滚动面板（保持你原来的逻辑）
@@ -4076,16 +4095,18 @@ class App:
 # 入口
 # =========================
 def main():
-    root = tk.Tk()
-    app = App(root)
+    app = App()
+    root = app.root
 
     def on_closing():
         try:
             app.cleanup()
         finally:
-            root.destroy()
+            if hasattr(root, "destroy"):
+                root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+    if hasattr(root, "protocol"):
+        root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
 
 if __name__ == "__main__":
