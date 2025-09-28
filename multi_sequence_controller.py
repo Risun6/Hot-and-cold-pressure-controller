@@ -278,7 +278,7 @@ class SequenceRunner(threading.Thread):
             "col": col,
             "temperature": temperature,
             "current": current,
-            "pressure": current,
+            "pressure": current,  # 按原始字段保留
             "temp_status": temp_status,
             "pressure_status": pressure_status,
             "status": "completed",
@@ -695,6 +695,7 @@ class MultiSequenceApp(ttk.Frame):
         def append() -> None:
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.log_text.see(tk.END)
+
         self.after(0, append)
 
     def add_result(self, result: Dict) -> None:
@@ -802,7 +803,10 @@ class MultiSequenceApp(ttk.Frame):
         self.stop_plan()
         self._rt_stop.set()
         if self._rt_thread and self._rt_thread.is_alive():
-            self._rt_thread.join(timeout=1.0)
+            try:
+                self._rt_thread.join(timeout=1.0)
+            except Exception:
+                pass
         target = self._window if destroy_window else self
         try:
             target.destroy()
