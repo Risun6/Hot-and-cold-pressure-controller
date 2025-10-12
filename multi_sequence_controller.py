@@ -684,7 +684,7 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(rt_row3, textvariable=self.realtime_timestamp_var, width=18).pack(side=tk.LEFT)
         ttk.Label(rt_row3, textvariable=self.realtime_status_var, bootstyle=WARNING).pack(side=tk.LEFT, padx=8)
 
-        charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
+        charts_frame = ttk.Labelframe(main, text="Live Charts (Last 5 Minutes)")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
 
 
@@ -693,22 +693,22 @@ class MultiSequenceApp(ttk.Frame):
         ax_temp = self._chart_fig.add_subplot(grid[0, 0])
         ax_press = self._chart_fig.add_subplot(grid[0, 1])
 
-        ax_temp.set_title("温度实时曲线")
-        ax_temp.set_ylabel("温度 (°C)")
-        ax_temp.set_xlabel("时间 (s)")
-        self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="当前温度")
+        ax_temp.set_title("Temperature Over Time")
+        ax_temp.set_ylabel("Temperature (°C)")
+        ax_temp.set_xlabel("Time (s)")
+        self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="Actual Temperature")
         self._temp_line_target, = ax_temp.plot(
-            [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="目标温度"
+            [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="Target Temperature"
         )
         ax_temp.grid(True, alpha=0.3)
         ax_temp.legend(loc="upper right", fontsize=8)
 
-        ax_press.set_title("压力实时曲线")
-        ax_press.set_ylabel("压力")
-        ax_press.set_xlabel("时间 (s)")
-        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="当前压力")
+        ax_press.set_title("Pressure Over Time")
+        ax_press.set_ylabel("Pressure")
+        ax_press.set_xlabel("Time (s)")
+        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="Actual Pressure")
         self._press_line_target, = ax_press.plot(
-            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="目标压力"
+            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="Target Pressure"
         )
         ax_press.grid(True, alpha=0.3)
         ax_press.legend(loc="upper right", fontsize=8)
