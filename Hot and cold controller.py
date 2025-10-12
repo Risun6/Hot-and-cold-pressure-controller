@@ -102,6 +102,8 @@ PID_KI = 0.2
 PID_KD = 0.0
 INTEGRAL_CLAMP = 200.0
 
+LEFT_PANEL_WIDTH = 760
+
 # ====== 循环泵（Modbus-RTU, 0x01/0x03/0x06/0x10，单位见协议）======
 PUMP_BAUD = 9600
 PUMP_ADDR_DEFAULT = 0x01
@@ -803,7 +805,7 @@ class App:
 
         # —— CSV 会话式记录 ——
         self.csv_dir = tk.StringVar(value=str(get_logs_dir()))  # 可配置目录（默认 logs）
-        self.csv_session_op = None  # 当前会话名："启动PID" / "开始线性程序"
+        self.csv_session_op = None  # 当前会话名："启动PID" / "启动线性程序"
         self.csv_session_path = None  # 当前会话文件路径
         self._last_click_ts = {}  # 防抖用的时间戳字典
 
@@ -1017,7 +1019,7 @@ class App:
         content.pack(fill=tk.BOTH, expand=True)
 
         # 左侧滚动面板（保持你原来的逻辑）
-        left_container = ttk.Frame(content, width=720)
+        left_container = ttk.Frame(content, width=LEFT_PANEL_WIDTH)
         left_container.pack(side=tk.LEFT, fill=tk.Y)
         left_container.pack_propagate(False)
 
@@ -1102,7 +1104,7 @@ class App:
         ttk.Checkbutton(r2, text="循环变温", variable=self.ramp_cycle_enable) \
             .pack(side=tk.LEFT, padx=(6, 12))
 
-        ttk.Button(r2, text="开始线性程序", bootstyle=SUCCESS, command=self._start_ramp) \
+        ttk.Button(r2, text="启动线性程序", bootstyle=SUCCESS, command=self._start_ramp) \
             .pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(r2, text="停止线性程序", bootstyle=WARNING, command=self._stop_ramp) \
             .pack(side=tk.LEFT)
@@ -1383,7 +1385,7 @@ class App:
         self.ent_csv_dir = ttk.Entry(rowr, textvariable=self.csv_dir, width=48)
         self.ent_csv_dir.pack(side=tk.LEFT, padx=(6, 8))
         ttk.Button(rowr, text="选择目录", command=self._choose_csv_dir, bootstyle=SECONDARY).pack(side=tk.LEFT)
-        ttk.Label(rec, text="规则：点击「启动PID/开始线性程序」新建；点击「停止…」保存并关闭。",
+        ttk.Label(rec, text="规则：点击「启动PID/启动线性程序」新建；点击「停止…」保存并关闭。",
                   bootstyle=INFO, wraplength=560, justify="left").pack(anchor="w", pady=(6, 0))
 
         plot_ctrl = ttk.Labelframe(left, text="绘图显示", padding=10);
@@ -2333,7 +2335,7 @@ class App:
 
                 # 开始：跨上起始阈
                 if (not csv_started) and (slope_cpm is not None) and (abs(slope_cpm) >= thr_start):
-                    self._csv_open_session("开始线性程序")
+                    self._csv_open_session("启动线性程序")
                     self._set_status(f"线性程序：斜率 |{slope_cpm:.3f}|≥{thr_start:.3f} °C/min，开始记录 CSV")
                     csv_started = True
                     below_stop_since = None
