@@ -1,12 +1,19 @@
 import json
+import math
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, scrolledtext
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from tcp_utils import JSONLineClient
 from sim_click import capture_click_point, perform_click_async
@@ -25,6 +32,7 @@ DEFAULT_PRESS_HOLD = 30.0
 DEFAULT_CELL_TIMEOUT = 300.0
 DEFAULT_CONFIRM_COUNT = 2
 REALTIME_REFRESH_S = 1.0
+CHART_HISTORY_SECONDS = 300.0
 
 
 class ControllerClient:
@@ -522,12 +530,23 @@ class MultiSequenceApp(ttk.Frame):
         self.runner: Optional[SequenceRunner] = None
         self.results: List[Dict] = []
 
+        self._chart_history_s = CHART_HISTORY_SECONDS
+        self._temp_history: Deque[Tuple[float, float, float]] = deque()
+        self._press_history: Deque[Tuple[float, float, float]] = deque()
+        self.chart_canvas: Optional[FigureCanvasTkAgg] = None
+        self._chart_fig: Optional[Figure] = None
+        self._temp_line_actual = None
+        self._temp_line_target = None
+        self._press_line_actual = None
+        self._press_line_target = None
+
         self._rt_stop = threading.Event()
         self._rt_lock = threading.Lock()
         self._rt_latest: Optional[Tuple[Optional[Dict], Optional[Dict], float]] = None
         self._rt_thread: Optional[threading.Thread] = None
 
         self._build_ui()
+        self._refresh_charts()
         self._init_default_matrix()
         self._start_realtime_monitor()
 
@@ -612,6 +631,37 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(rt_row3, text="最近更新时间：").pack(side=tk.LEFT, padx=4)
         ttk.Label(rt_row3, textvariable=self.realtime_timestamp_var, width=18).pack(side=tk.LEFT)
         ttk.Label(rt_row3, textvariable=self.realtime_status_var, bootstyle=WARNING).pack(side=tk.LEFT, padx=8)
+
+        charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
+        charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+
+        self._chart_fig = Figure(figsize=(9, 5), dpi=100)
+        grid = self._chart_fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.32)
+        ax_temp = self._chart_fig.add_subplot(grid[0, 0])
+        ax_press = self._chart_fig.add_subplot(grid[1, 0], sharex=ax_temp)
+
+        ax_temp.set_title("温度实时曲线")
+        ax_temp.set_ylabel("温度 (°C)")
+        self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="当前温度")
+        self._temp_line_target, = ax_temp.plot(
+            [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="目标温度"
+        )
+        ax_temp.grid(True, alpha=0.3)
+        ax_temp.legend(loc="upper right", fontsize=8)
+        ax_temp.tick_params(labelbottom=False)
+
+        ax_press.set_title("压力 / 电流实时曲线")
+        ax_press.set_ylabel("压力 / 电流")
+        ax_press.set_xlabel("时间 (s)")
+        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="当前值")
+        self._press_line_target, = ax_press.plot(
+            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="目标值"
+        )
+        ax_press.grid(True, alpha=0.3)
+        ax_press.legend(loc="upper right", fontsize=8)
+
+        self.chart_canvas = FigureCanvasTkAgg(self._chart_fig, master=charts_frame)
+        self.chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         buttons = ttk.Frame(main)
         buttons.pack(fill=tk.X, pady=8)
@@ -930,6 +980,8 @@ class MultiSequenceApp(ttk.Frame):
             temp_status, press_status, ts = latest
             self._update_temp_display(temp_status)
             self._update_press_display(press_status)
+            self._collect_chart_points(temp_status, press_status, ts)
+            self._refresh_charts()
             self.realtime_timestamp_var.set(time.strftime("%H:%M:%S", time.localtime(ts)))
             errors = []
             if temp_status and temp_status.get("__error__"):
@@ -946,6 +998,91 @@ class MultiSequenceApp(ttk.Frame):
             return f"{float(value):.3f}{unit}"
         except Exception:
             return "--"
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        try:
+            f = float(value)
+        except Exception:
+            return None
+        if math.isnan(f):
+            return None
+        return f
+
+    def _append_history(
+        self,
+        history: Deque[Tuple[float, float, float]],
+        timestamp: float,
+        actual: float,
+        target: float,
+    ) -> None:
+        if math.isnan(actual) and math.isnan(target):
+            return
+        history.append((timestamp, actual, target))
+        cutoff = timestamp - float(self._chart_history_s)
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    @staticmethod
+    def _extract_pressure_value(status: Dict[str, Any]) -> Optional[float]:
+        last = status.get("last")
+        if isinstance(last, dict):
+            for key in ("feedback", "pressure", "value"):
+                if last.get(key) is not None:
+                    return last.get(key)
+        return status.get("pressure")
+
+    def _collect_chart_points(
+        self,
+        temp_status: Optional[Dict[str, Any]],
+        press_status: Optional[Dict[str, Any]],
+        timestamp: float,
+    ) -> None:
+        if temp_status and not temp_status.get("__error__"):
+            actual = self._coerce_float(temp_status.get("temperature"))
+            target = self._coerce_float(temp_status.get("target"))
+            actual = actual if actual is not None else math.nan
+            target = target if target is not None else math.nan
+            self._append_history(self._temp_history, timestamp, actual, target)
+        if press_status and not press_status.get("__error__"):
+            actual_val = self._coerce_float(self._extract_pressure_value(press_status))
+            target_val = self._coerce_float(press_status.get("target"))
+            actual_val = actual_val if actual_val is not None else math.nan
+            target_val = target_val if target_val is not None else math.nan
+            self._append_history(self._press_history, timestamp, actual_val, target_val)
+
+    def _refresh_charts(self) -> None:
+        if not self.chart_canvas or not self._chart_fig:
+            return
+        self._update_chart_lines(self._temp_history, self._temp_line_actual, self._temp_line_target)
+        self._update_chart_lines(self._press_history, self._press_line_actual, self._press_line_target)
+        self._chart_fig.canvas.draw_idle()
+
+    def _update_chart_lines(
+        self,
+        history: Deque[Tuple[float, float, float]],
+        line_actual,
+        line_target,
+    ) -> None:
+        if line_actual is None or line_target is None:
+            return
+        if not history:
+            line_actual.set_data([], [])
+            line_target.set_data([], [])
+            return
+        base = history[0][0]
+        times = [item[0] - base for item in history]
+        actual = [item[1] for item in history]
+        target = [item[2] for item in history]
+        line_actual.set_data(times, actual)
+        line_target.set_data(times, target)
+        axis = line_actual.axes
+        axis.relim()
+        axis.autoscale_view()
+        if times[-1] <= 0:
+            axis.set_xlim(0, self._chart_history_s)
+        else:
+            axis.set_xlim(max(0.0, times[-1] - self._chart_history_s), times[-1])
 
     def _update_temp_display(self, status: Optional[Dict]) -> None:
         if not status:
@@ -977,7 +1114,12 @@ class MultiSequenceApp(ttk.Frame):
             self.press_error_var.set(status.get("__error__"))
             return
         last = status.get("last", {}) if isinstance(status.get("last"), dict) else {}
-        self.press_live_var.set(self._fmt_value(last.get("feedback")))
+        feedback = last.get("feedback")
+        if feedback is None:
+            feedback = last.get("pressure")
+        if feedback is None:
+            feedback = status.get("pressure")
+        self.press_live_var.set(self._fmt_value(feedback))
         self.press_target_var.set(self._fmt_value(status.get("target")))
         error = last.get("error")
         if error is None and status.get("mae") is not None:
