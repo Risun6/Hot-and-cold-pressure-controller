@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from types import ModuleType
 
 import ttkbootstrap as ttk
+from tkinter import scrolledtext
 
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -41,8 +44,21 @@ class UnifiedController(ttk.Window):
         self.title("冷热压力一体化控制台")
         self.geometry("1720x980")
 
-        self.notebook = ttk.Notebook(self, padding=8)
+        paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        left_panel = ttk.Frame(paned)
+        right_panel = ttk.Labelframe(paned, text="日志", padding=8)
+
+        paned.add(left_panel, weight=4)
+        paned.add(right_panel, weight=2)
+
+        self.notebook = ttk.Notebook(left_panel, padding=8)
         self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = scrolledtext.ScrolledText(right_panel, state="disabled", width=48)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self._log_lock = threading.Lock()
 
         temp_tab = ttk.Frame(self.notebook)
         press_tab = ttk.Frame(self.notebook)
@@ -63,6 +79,11 @@ class UnifiedController(ttk.Window):
             pressure_controller=self.pressure_app,
         )
 
+        for child in (self.temperature_app, self.pressure_app, self.sequence_app):
+            setter = getattr(child, "set_external_logger", None)
+            if callable(setter):
+                setter(self.append_log)
+
         # 统一填充，使三个子界面都自适应可用空间
         for child in (self.temperature_app.container, self.pressure_app, self.sequence_app):
             try:
@@ -71,6 +92,18 @@ class UnifiedController(ttk.Window):
                 pass
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def append_log(self, message: str) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda m=message: self.append_log(m))
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        text = f"{timestamp} - {message}\n"
+        with self._log_lock:
+            self.log_text.configure(state="normal")
+            self.log_text.insert(tk.END, text)
+            self.log_text.see(tk.END)
+            self.log_text.configure(state="disabled")
 
     def _on_close(self) -> None:
         for cleanup in (
