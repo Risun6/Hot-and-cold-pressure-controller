@@ -326,6 +326,9 @@ class App(ttk.Frame):
 
         self.loaded_config = {}
 
+        self._ui_refresh_default_ms = 60.0
+        self._plot_refresh_default_ms = 80.0
+
         self.default_params = {
             "pos_interval": "0.01",
             "press_interval": "0.01",
@@ -345,7 +348,9 @@ class App(ttk.Frame):
             "baud_rate2": "9600",
             "high_speed": 0.01,
             "low_speed": 0.001,
-            "pressure_tolerance": 10.0
+            "pressure_tolerance": 10.0,
+            "ui_refresh_interval_ms": self._ui_refresh_default_ms,
+            "plot_refresh_interval_ms": self._plot_refresh_default_ms,
         }
         self.send_jump_enabled = {i: False for i in range(1, 9)}
         self.jump_signal_sent = {i: False for i in range(1, 9)}
@@ -358,6 +363,14 @@ class App(ttk.Frame):
         self.pressure_display_var = tk.StringVar(value="压力: 0g")
         self.current_pos_var = tk.StringVar(value="0.0")
         self.current_speed_var = tk.StringVar(value="0.0")
+        self.ui_refresh_interval_ms_var = tk.StringVar(
+            value=self._format_interval(self._ui_refresh_default_ms)
+        )
+        self.plot_refresh_interval_ms_var = tk.StringVar(
+            value=self._format_interval(self._plot_refresh_default_ms)
+        )
+        self.ui_refresh_rate_var = tk.StringVar(value="")
+        self.plot_refresh_rate_var = tk.StringVar(value="")
         self.pressure_queue = queue.Queue()
         self.position_queue = queue.Queue()
         self.last_press_read = time.time()
@@ -369,8 +382,8 @@ class App(ttk.Frame):
         self.main_canvas = None
         self.scrollbar = None
         self.scrollable_frame = None
-        self.ui_update_thread = None
-        self.plot_update_thread = None
+        self._ui_update_job = None
+        self._plot_update_job = None
         self.pressure_control_thread = None
         self.pressure_control_running = False
         self.target_pressure = 0.0
@@ -382,6 +395,8 @@ class App(ttk.Frame):
         self.debug_mode = True
         self.device_thread = None
         self.pixel_detection_paused_until = 0
+        self._periodic_jobs_enabled = False
+        self._last_pixel_check_ts = time.time()
 
         # 多压力测试相关
         self.multi_pressure_mode_var = tk.BooleanVar(value=False)
@@ -414,17 +429,22 @@ class App(ttk.Frame):
         self.log(f"配置文件路径: {self.CONFIG_PATH}")
         self.refresh_ports()
 
-        # 启动UI更新线程
-        self.ui_update_thread = threading.Thread(target=self.update_ui_periodically, daemon=True)
-        self.ui_update_thread.start()
-
-        # 启动图表更新线程
-        self.plot_update_thread = threading.Thread(target=self.update_plot_periodically, daemon=True)
-        self.plot_update_thread.start()
+        self.ui_refresh_interval_ms_var.trace_add(
+            "write", self._on_ui_refresh_interval_changed
+        )
+        self.plot_refresh_interval_ms_var.trace_add(
+            "write", self._on_plot_refresh_interval_changed
+        )
+        self._on_ui_refresh_interval_changed()
+        self._on_plot_refresh_interval_changed()
 
         # 加载配置
         self.load_config()
         self.validate_intervals()
+
+        self._periodic_jobs_enabled = True
+        self._reschedule_ui_update()
+        self._reschedule_plot_update()
 
         self.flashing = False
         self.flash_state = False
@@ -772,6 +792,40 @@ class App(ttk.Frame):
             .pack(side=tk.RIGHT, padx=5, pady=2)
         ttk.Button(press_frame, text="自动去皮", command=self.start_auto_tare, bootstyle="success") \
             .pack(side=tk.RIGHT, padx=5, pady=2)
+
+        refresh_frame = ttk.LabelFrame(self.scrollable_frame, text="界面刷新设置")
+        refresh_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(refresh_frame, text="数据显示刷新间隔(ms):").grid(
+            row=0, column=0, padx=5, pady=4, sticky='e'
+        )
+        ui_interval_entry = ttk.Entry(
+            refresh_frame, textvariable=self.ui_refresh_interval_ms_var, width=8
+        )
+        ui_interval_entry.grid(row=0, column=1, padx=5, pady=4, sticky='w')
+        self._disable_mouse_wheel(ui_interval_entry)
+        ttk.Label(
+            refresh_frame,
+            textvariable=self.ui_refresh_rate_var,
+            bootstyle="secondary"
+        ).grid(row=0, column=2, padx=5, pady=4, sticky='w')
+
+        ttk.Label(refresh_frame, text="曲线刷新间隔(ms):").grid(
+            row=1, column=0, padx=5, pady=4, sticky='e'
+        )
+        plot_interval_entry = ttk.Entry(
+            refresh_frame, textvariable=self.plot_refresh_interval_ms_var, width=8
+        )
+        plot_interval_entry.grid(row=1, column=1, padx=5, pady=4, sticky='w')
+        self._disable_mouse_wheel(plot_interval_entry)
+        ttk.Label(
+            refresh_frame,
+            textvariable=self.plot_refresh_rate_var,
+            bootstyle="secondary"
+        ).grid(row=1, column=2, padx=5, pady=4, sticky='w')
+
+        ttk.Label(refresh_frame, text="有效范围: 20–1000 ms", bootstyle="secondary") \
+            .grid(row=0, column=3, rowspan=2, padx=5, pady=4, sticky='w')
+        refresh_frame.grid_columnconfigure(2, weight=1)
 
         # ===== 自动多压力测试 =====
         multi_pressure_frame = ttk.LabelFrame(self.scrollable_frame, text="自动多压力测试")
@@ -2235,31 +2289,123 @@ class App(ttk.Frame):
                 last_pos_time = now
             time.sleep(0.005)
 
-    def update_ui_periodically(self):
-        update_interval = 0.05
-        last_pixel_check = time.time()
+    def _normalize_interval_value(self, raw_value, default):
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, tk.TclError):
+            value = default
+        if not math.isfinite(value) or value <= 0:
+            value = default
+        return max(20.0, min(1000.0, value))
 
-        while True:
+    def _format_interval(self, value: float) -> str:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "0"
+        if abs(value - round(value)) < 1e-6:
+            return str(int(round(value)))
+        return f"{value:.1f}"
+
+    def _get_interval_ms(self, var: tk.StringVar, default: float) -> float:
+        return self._normalize_interval_value(var.get(), default)
+
+    @staticmethod
+    def _update_refresh_rate_label(label_var: tk.StringVar, interval_ms: float) -> None:
+        hz = 1000.0 / interval_ms if interval_ms > 0 else 0.0
+        label_var.set(f"≈ {hz:.1f} Hz")
+
+    def _on_ui_refresh_interval_changed(self, *_args):
+        interval_ms = self._get_interval_ms(
+            self.ui_refresh_interval_ms_var, self._ui_refresh_default_ms
+        )
+        self._update_refresh_rate_label(self.ui_refresh_rate_var, interval_ms)
+        if getattr(self, "_periodic_jobs_enabled", False):
+            self._reschedule_ui_update(interval_ms)
+
+    def _on_plot_refresh_interval_changed(self, *_args):
+        interval_ms = self._get_interval_ms(
+            self.plot_refresh_interval_ms_var, self._plot_refresh_default_ms
+        )
+        self._update_refresh_rate_label(self.plot_refresh_rate_var, interval_ms)
+        if getattr(self, "_periodic_jobs_enabled", False):
+            self._reschedule_plot_update(interval_ms)
+
+    def _reschedule_ui_update(self, interval_ms: float | None = None) -> None:
+        if self._ui_update_job is not None:
+            try:
+                self.after_cancel(self._ui_update_job)
+            except Exception:
+                pass
+            self._ui_update_job = None
+        if not getattr(self, "_periodic_jobs_enabled", False):
+            return
+        if interval_ms is None:
+            interval_ms = self._get_interval_ms(
+                self.ui_refresh_interval_ms_var, self._ui_refresh_default_ms
+            )
+        interval_ms = max(1, int(round(interval_ms)))
+        self._ui_update_job = self.after(interval_ms, self.update_ui_periodically)
+
+    def _reschedule_plot_update(self, interval_ms: float | None = None) -> None:
+        if self._plot_update_job is not None:
+            try:
+                self.after_cancel(self._plot_update_job)
+            except Exception:
+                pass
+            self._plot_update_job = None
+        if not getattr(self, "_periodic_jobs_enabled", False):
+            return
+        if interval_ms is None:
+            interval_ms = self._get_interval_ms(
+                self.plot_refresh_interval_ms_var, self._plot_refresh_default_ms
+            )
+        interval_ms = max(1, int(round(interval_ms)))
+        self._plot_update_job = self.after(interval_ms, self.update_plot_periodically)
+
+    def _cancel_periodic_jobs(self) -> None:
+        self._periodic_jobs_enabled = False
+        for attr in ("_ui_update_job", "_plot_update_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def update_ui_periodically(self):
+        self._ui_update_job = None
+        if not getattr(self, "_periodic_jobs_enabled", False):
+            return
+
+        try:
             self.process_queued_data()
             self.current_pos_var.set(f"{self.current_position:.3f}")
             self.refresh_pressure_display()
 
             now = time.time()
-            if (self.pixel_detection_enabled.get()
-                    and not self.pressure_control_running
-                    and now >= self.pixel_detection_paused_until):
-                interval_s = self.detection_interval_var.get() / 1000.0
-                if now - last_pixel_check >= interval_s:
+            if (not self.pixel_detection_enabled.get()
+                    or self.pressure_control_running
+                    or now < self.pixel_detection_paused_until):
+                self._last_pixel_check_ts = now
+            else:
+                try:
+                    interval_s = float(self.detection_interval_var.get()) / 1000.0
+                except Exception:
+                    interval_s = 1.0
+                interval_s = max(interval_s, 0.05)
+                if now - getattr(self, "_last_pixel_check_ts", 0.0) >= interval_s:
                     changed, msg = self.check_pixel_change()
                     if self.pixel_log_enabled.get():
                         self.log(f"像素检测: {msg}")
                     if changed:
                         self.set_indicator_color("green")
-                    last_pixel_check = now
+                    self._last_pixel_check_ts = now
 
             try:
                 safety_val = float(self.safety_pressure_var.get())
-            except:
+            except Exception:
                 safety_val = 2000.0
 
             if self.current_pressure >= safety_val:
@@ -2271,7 +2417,14 @@ class App(ttk.Frame):
                     self.flashing = False
                 self.big_pressure_label.config(background="white", foreground="black")
 
-            time.sleep(update_interval)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.log(f"UI 刷新异常: {exc}")
+            except Exception:
+                pass
+        finally:
+            if getattr(self, "_periodic_jobs_enabled", False):
+                self._reschedule_ui_update()
 
     def start_pressure_flash(self):
         if not self.flashing:
@@ -2291,93 +2444,94 @@ class App(ttk.Frame):
         - 过滤 NaN/Inf
         - 抽稀到最多 ~3000 点，降低重绘负担
         """
-        import bisect, math
+        import bisect
+
+        self._plot_update_job = None
+        if not getattr(self, "_periodic_jobs_enabled", False):
+            return
+
         MAX_POINTS = 3000  # 每条曲线最多绘制的点数
-        REFRESH_INTERVAL = 0.05  # 图表刷新周期（秒）
 
-        while True:
+        try:
+            n = min(len(self.time_data), len(self.pos_data), len(self.pressure_data))
+            if n < 1:
+                return
+
+            t = list(self.time_data[-n:])
+            pos = list(self.pos_data[-n:])
+            pre = list(self.pressure_data[-n:])
+
+            filtered = [
+                (ti, xi, yi)
+                for ti, xi, yi in zip(t, pos, pre)
+                if (
+                    ti is not None
+                    and xi is not None
+                    and yi is not None
+                    and math.isfinite(ti)
+                    and math.isfinite(xi)
+                    and math.isfinite(yi)
+                )
+            ]
+            if not filtered:
+                return
+            t, pos, pre = map(list, zip(*filtered))
+
             try:
-                # —— 拷贝快照，避免和采集线程抢数据 —— #
-                n = min(len(self.time_data), len(self.pos_data), len(self.pressure_data))
-                if n < 1:
-                    time.sleep(REFRESH_INTERVAL)
-                    continue
-
-                t = list(self.time_data[-n:])
-                pos = list(self.pos_data[-n:])
-                pre = list(self.pressure_data[-n:])
-
-                # 过滤非法数值
-                filtered = [(ti, xi, yi) for ti, xi, yi in zip(t, pos, pre)
-                            if (ti is not None and xi is not None and yi is not None
-                                and math.isfinite(ti) and math.isfinite(xi) and math.isfinite(yi))]
-                if not filtered:
-                    time.sleep(REFRESH_INTERVAL)
-                    continue
-                t, pos, pre = map(list, zip(*filtered))
-
-                # —— 读取时间窗 —— #
-                try:
-                    window_s = float(self.plot_window_seconds_var.get())
-                    if window_s < 0:
-                        window_s = 0.0
-                except Exception:
+                window_s = float(self.plot_window_seconds_var.get())
+                if window_s < 0:
                     window_s = 0.0
+            except Exception:
+                window_s = 0.0
 
-                # —— 裁剪到时间窗 —— #
-                if window_s > 0 and len(t) > 1:
-                    t_end = t[-1]
-                    t_start = t_end - window_s
-                    i0 = bisect.bisect_left(t, t_start)  # t 需单调递增（采集时间应满足）
-                    t, pos, pre = t[i0:], pos[i0:], pre[i0:]
+            if window_s > 0 and len(t) > 1:
+                t_end = t[-1]
+                t_start = t_end - window_s
+                i0 = bisect.bisect_left(t, t_start)
+                t, pos, pre = t[i0:], pos[i0:], pre[i0:]
 
-                    # 若裁剪后为空（极端情况），保底留最后一个点
-                    if not t:
-                        t, pos, pre = [t_end], [pos[-1]], [pre[-1]]
+                if not t:
+                    t, pos, pre = [t_end], [pos[-1]], [pre[-1]]
 
-                # —— 抽稀 —— #
+            n = len(t)
+            if n > MAX_POINTS:
+                step = max(1, n // MAX_POINTS)
+                t = t[::step]
+                pos = pos[::step]
+                pre = pre[::step]
                 n = len(t)
-                if n > MAX_POINTS:
-                    step = max(1, n // MAX_POINTS)
-                    t = t[::step];
-                    pos = pos[::step];
-                    pre = pre[::step]
-                    n = len(t)
 
-                # —— 更新曲线数据 —— #
-                self.line_pos.set_data(t, pos)
-                self.line_press.set_data(t, pre)
+            self.line_pos.set_data(t, pos)
+            self.line_press.set_data(t, pre)
 
-                # —— X 轴范围（防止上下限相同）—— #
-                if n >= 1:
-                    x0, x1 = t[0], t[-1]
-                    if x1 == x0:
-                        # 只有一个时间点：给一个与时间窗相关的小余量；若无窗，则给 1s 余量
-                        pad = max(1e-6, (0.02 * window_s) if window_s > 0 else 1.0)
-                        self.ax.set_xlim(x0 - pad, x1 + pad)
-                    else:
-                        self.ax.set_xlim(x0, x1)
+            if n >= 1:
+                x0, x1 = t[0], t[-1]
+                if x1 == x0:
+                    pad = max(1e-6, (0.02 * window_s) if window_s > 0 else 1.0)
+                    self.ax.set_xlim(x0 - pad, x1 + pad)
+                else:
+                    self.ax.set_xlim(x0, x1)
 
-                # —— Y 轴自适应 + 5% 余量 —— #
-                if pos:
-                    ymin, ymax = min(pos), max(pos)
-                    pad = max(1e-9, (ymax - ymin) * 0.05 if ymax != ymin else abs(ymin) * 0.05 or 1e-6)
-                    self.ax.set_ylim(ymin - pad, ymax + pad)
+            if pos:
+                ymin, ymax = min(pos), max(pos)
+                pad = max(1e-9, (ymax - ymin) * 0.05 if ymax != ymin else abs(ymin) * 0.05 or 1e-6)
+                self.ax.set_ylim(ymin - pad, ymax + pad)
 
-                if pre:
-                    ymin2, ymax2 = min(pre), max(pre)
-                    pad2 = max(1e-9, (ymax2 - ymin2) * 0.05 if ymax2 != ymin2 else abs(ymin2) * 0.05 or 1e-6)
-                    self.ax2.set_ylim(ymin2 - pad2, ymax2 + pad2)
+            if pre:
+                ymin2, ymax2 = min(pre), max(pre)
+                pad2 = max(1e-9, (ymax2 - ymin2) * 0.05 if ymax2 != ymin2 else abs(ymin2) * 0.05 or 1e-6)
+                self.ax2.set_ylim(ymin2 - pad2, ymax2 + pad2)
 
-                self.canvas.draw_idle()
+            self.canvas.draw_idle()
 
-            except Exception as e:
-                try:
-                    self.log(f"绘图更新异常：{e}")
-                except Exception:
-                    pass
-
-            time.sleep(REFRESH_INTERVAL)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.log(f"绘图更新异常：{e}")
+            except Exception:
+                pass
+        finally:
+            if getattr(self, "_periodic_jobs_enabled", False):
+                self._reschedule_plot_update()
 
     def process_queued_data(self):
         while not self.position_queue.empty():
@@ -3093,6 +3247,17 @@ class App(ttk.Frame):
                     self.pressure_step_interval_var.set(float(config.get("pressure_step_interval", 60.0)))  # s
                     self.timeout_var.set(int(config.get("timeout", 8000)))  # ms
 
+                    ui_refresh = self._normalize_interval_value(
+                        config.get("ui_refresh_interval_ms", self._ui_refresh_default_ms),
+                        self._ui_refresh_default_ms,
+                    )
+                    plot_refresh = self._normalize_interval_value(
+                        config.get("plot_refresh_interval_ms", self._plot_refresh_default_ms),
+                        self._plot_refresh_default_ms,
+                    )
+                    self.ui_refresh_interval_ms_var.set(self._format_interval(ui_refresh))
+                    self.plot_refresh_interval_ms_var.set(self._format_interval(plot_refresh))
+
                     # —— 新增：跳变设置 —— #
                     if hasattr(self, 'jump_loop_count_var'):
                         self.jump_loop_count_var.set(int(config.get("jump_loop_count", 0)))
@@ -3153,6 +3318,12 @@ class App(ttk.Frame):
             "detection_interval": int(self.detection_interval_var.get()),  # ms
             "pressure_step_interval": float(self.pressure_step_interval_var.get()),  # s
             "timeout": int(self.timeout_var.get()),  # ms
+            "ui_refresh_interval_ms": self._get_interval_ms(
+                self.ui_refresh_interval_ms_var, self._ui_refresh_default_ms
+            ),
+            "plot_refresh_interval_ms": self._get_interval_ms(
+                self.plot_refresh_interval_ms_var, self._plot_refresh_default_ms
+            ),
 
             # —— 新增：跳变设置持久化 —— #
             "jump_loop_count": int(self.jump_loop_count_var.get()) if hasattr(self, 'jump_loop_count_var') else 0,
@@ -3211,6 +3382,12 @@ class App(ttk.Frame):
                 self.press_interval_entry.insert(0, str(self.MIN_INTERVAL))
 
     def start_pressure_control(self, notify=True):
+        if not (self.sensor_connected and self.controller_connected):
+            if notify:
+                messagebox.showerror("错误", "请先连接压力传感器和运动控制器")
+            else:
+                self.log("压力控制启动失败：设备未全部连接")
+            return False
         try:
             self.target_pressure = float(self.target_pressure_var.get())
             self.pressure_tolerance = float(self.tolerance_var.get())
@@ -3238,139 +3415,165 @@ class App(ttk.Frame):
         self.log(f"开始压力控制: 目标压力={self.target_pressure}g, 容差={self.pressure_tolerance}g")
         self.pressure_control_thread = threading.Thread(target=self.pressure_control_loop, daemon=True)
         self.pressure_control_thread.start()
+        self._refresh_pressure_button_states()
         return True
 
-    def stop_pressure_control(self):
-        self.pressure_control_running = False
-        self.log("压力控制已停止")
+    def _finalize_pressure_control(self, *, mark_stopped: bool = True, clear_thread: bool = False):
+        """集中处理停止压力控制时的公共清理逻辑。"""
+        if mark_stopped:
+            self.pressure_control_running = False
+        if clear_thread:
+            self.pressure_control_thread = None
         self.stop_motion()
         self.current_speed_var.set("0.000")
+        self._refresh_pressure_button_states()
+
+    def stop_pressure_control(self):
+        if not self.pressure_control_running:
+            self.log("压力控制当前未运行")
+            self._finalize_pressure_control(mark_stopped=False)
+            return
+
+        self.log("压力控制已停止")
+        thread = getattr(self, "pressure_control_thread", None)
+        thread_alive = bool(thread and thread.is_alive())
+        self._finalize_pressure_control(clear_thread=not thread_alive)
 
     def pressure_control_loop(self):
         self.log("压力控制线程启动")
         try:
-            target_pressure = float(self.target_pressure_var.get())
-            high_speed = float(self.high_speed_var.get())
-            low_speed = float(self.low_speed_var.get())
-            progressive_zone = float(self.progressive_zone_var.get())
-            safety_pressure = float(self.safety_pressure_var.get())
-            mode = self.motion_mode_var.get()
-        except Exception as e:
-            self.log(f"参数读取错误: {e}")
-            return
-
-        jog_step = self.jog_step_mm
-
-        highspeed_active = False
-        continuous_active = False
-        stable_cnt = 0
-        stable_need = 5
-        in_stable_state = False
-        adjust_dir = None
-
-        while self.pressure_control_running:
             try:
-                current_pressure = self.read_pressure()
-                diff = target_pressure - current_pressure
-                abs_diff = abs(diff)
-                try:
-                    tolerance = float(self.tolerance_var.get())
-                except:
-                    tolerance = 10.0
-
-                if current_pressure >= safety_pressure:
-                    self.log(f"⚠️ 保护压力触发！{current_pressure:.1f} ≥ {safety_pressure:.1f} g")
-                    self.stop_motion()
-                    self.current_speed_var.set("0.000")
-                    self.after(0, lambda: messagebox.showwarning("保护压力", f"压力超过保护值 ({safety_pressure} g)，已急停"))
-                    break
-
-                if abs_diff > tolerance:
-                    if in_stable_state:
-                        self.log("压力漂移出容差，重新调节")
-                        in_stable_state = False
-                        stable_cnt = 0
-
-                    if abs_diff > progressive_zone:
-                        desired_dir = "下" if diff > 0 else "上"
-                        if (not highspeed_active) or (self.direction.get() != desired_dir):
-                            self.stop_motion()
-                            self.direction.set(desired_dir)
-                            self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(high_speed))
-                            self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, "20.0")
-                            self.set_parameters(); self.start_machine()
-                            self.current_speed_var.set(f"{high_speed:.3f}")
-                            self.log(f"区间外高速{'下压' if diff > 0 else '抬升'}开始 ΔP={abs_diff:.1f} g")
-                            highspeed_active = True
-                            continuous_active = False
-                        time.sleep(0.05)
-                        continue
-
-                    if highspeed_active:
-                        self.stop_motion()
-                        highspeed_active = False
-
-                    if mode == "点动":
-                        desired_dir = "下" if diff > 0 else "上"
-                        if adjust_dir != desired_dir:
-                            self.direction.set(desired_dir)
-                            self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(low_speed))
-                            self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, str(jog_step))
-                            self.set_parameters()
-                            adjust_dir = desired_dir
-                            self.log(f"渐进区 → 设置 {desired_dir} 点动参数：{low_speed} mm/s, {jog_step} mm")
-
-                        self.start_machine()
-                        self.current_speed_var.set(f"{low_speed:.3f}")
-                        self.stop_motion()
-                        current_pressure = self.read_pressure()
-                        diff = target_pressure - current_pressure
-                        abs_diff = abs(diff)
-                        crossed = (diff > 0 and adjust_dir == "上") or (diff < 0 and adjust_dir == "下")
-                        if crossed:
-                            self.log("已越过目标压力，切换方向精调")
-                            adjust_dir = None
-                        continue
-                    else:
-                        desired_dir = "下" if diff > 0 else "上"
-                        if (not continuous_active) or self.direction.get() != desired_dir or self.params_modified:
-                            self.stop_motion()
-                            self.direction.set(desired_dir)
-                            self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(low_speed))
-                            self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, "20.0")
-                            self.set_parameters(); self.start_machine()
-                            self.current_speed_var.set(f"{low_speed:.3f}")
-                            self.log(f"渐进区低速持续{'下压' if diff > 0 else '抬升'}")
-                            continuous_active = True
-                        time.sleep(0.05)
-                        continue
-
-                stable_cnt += 1
-                if stable_cnt >= stable_need and not in_stable_state:
-                    self.stop_motion()
-                    self.current_speed_var.set("0.000")
-                    self.log(f"压力进入恒压保持 ±{tolerance} g")
-                    in_stable_state = True
-                    highspeed_active = False
-                    continuous_active = False
-                time.sleep(0.05)
-
+                target_pressure = float(self.target_pressure_var.get())
+                high_speed = float(self.high_speed_var.get())
+                low_speed = float(self.low_speed_var.get())
+                progressive_zone = float(self.progressive_zone_var.get())
+                safety_pressure = float(self.safety_pressure_var.get())
+                mode = self.motion_mode_var.get()
             except Exception as e:
-                self.log(f"压力控制异常: {e}")
-                time.sleep(0.2)
+                self.log(f"参数读取错误: {e}")
+                return
 
-        self.stop_motion()
-        self.current_speed_var.set("0.000")
-        self.pressure_control_running = False
-        self.log("压力控制线程结束")
+            jog_step = self.jog_step_mm
+
+            highspeed_active = False
+            continuous_active = False
+            stable_cnt = 0
+            stable_need = 5
+            in_stable_state = False
+            adjust_dir = None
+
+            while self.pressure_control_running:
+                try:
+                    current_pressure = self.read_pressure()
+                    diff = target_pressure - current_pressure
+                    abs_diff = abs(diff)
+                    try:
+                        tolerance = float(self.tolerance_var.get())
+                    except:
+                        tolerance = 10.0
+
+                    if current_pressure >= safety_pressure:
+                        self.log(f"⚠️ 保护压力触发！{current_pressure:.1f} ≥ {safety_pressure:.1f} g")
+                        self.stop_motion()
+                        self.current_speed_var.set("0.000")
+                        self.after(0, lambda: messagebox.showwarning("保护压力", f"压力超过保护值 ({safety_pressure} g)，已急停"))
+                        break
+
+                    if abs_diff > tolerance:
+                        if in_stable_state:
+                            self.log("压力漂移出容差，重新调节")
+                            in_stable_state = False
+                            stable_cnt = 0
+
+                        if abs_diff > progressive_zone:
+                            desired_dir = "下" if diff > 0 else "上"
+                            if (not highspeed_active) or (self.direction.get() != desired_dir):
+                                self.stop_motion()
+                                self.direction.set(desired_dir)
+                                self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(high_speed))
+                                self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, "20.0")
+                                self.set_parameters(); self.start_machine()
+                                self.current_speed_var.set(f"{high_speed:.3f}")
+                                self.log(f"区间外高速{'下压' if diff > 0 else '抬升'}开始 ΔP={abs_diff:.1f} g")
+                                highspeed_active = True
+                                continuous_active = False
+                            time.sleep(0.05)
+                            continue
+
+                        if highspeed_active:
+                            self.stop_motion()
+                            highspeed_active = False
+
+                        if mode == "点动":
+                            desired_dir = "下" if diff > 0 else "上"
+                            if adjust_dir != desired_dir:
+                                self.direction.set(desired_dir)
+                                self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(low_speed))
+                                self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, str(jog_step))
+                                self.set_parameters()
+                                adjust_dir = desired_dir
+                                self.log(f"渐进区 → 设置 {desired_dir} 点动参数：{low_speed} mm/s, {jog_step} mm")
+
+                            self.start_machine()
+                            self.current_speed_var.set(f"{low_speed:.3f}")
+                            self.stop_motion()
+                            current_pressure = self.read_pressure()
+                            diff = target_pressure - current_pressure
+                            abs_diff = abs(diff)
+                            crossed = (diff > 0 and adjust_dir == "上") or (diff < 0 and adjust_dir == "下")
+                            if crossed:
+                                self.log("已越过目标压力，切换方向精调")
+                                adjust_dir = None
+                            continue
+                        else:
+                            desired_dir = "下" if diff > 0 else "上"
+                            if (not continuous_active) or self.direction.get() != desired_dir or self.params_modified:
+                                self.stop_motion()
+                                self.direction.set(desired_dir)
+                                self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(low_speed))
+                                self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, "20.0")
+                                self.set_parameters(); self.start_machine()
+                                self.current_speed_var.set(f"{low_speed:.3f}")
+                                self.log(f"渐进区低速持续{'下压' if diff > 0 else '抬升'}")
+                                continuous_active = True
+                            time.sleep(0.05)
+                            continue
+
+                    stable_cnt += 1
+                    if stable_cnt >= stable_need and not in_stable_state:
+                        self.stop_motion()
+                        self.current_speed_var.set("0.000")
+                        self.log(f"压力进入恒压保持 ±{tolerance} g")
+                        in_stable_state = True
+                        highspeed_active = False
+                        continuous_active = False
+                    time.sleep(0.05)
+
+                except Exception as e:
+                    self.log(f"压力控制异常: {e}")
+                    time.sleep(0.2)
+        finally:
+            self._finalize_pressure_control(clear_thread=True)
+            self.log("压力控制线程结束")
 
     def update_button_states(self):
+        start_btn = getattr(self, "start_pressure_btn", None)
+        stop_btn = getattr(self, "stop_pressure_btn", None)
+        if not start_btn or not stop_btn:
+            return
+
         if self.sensor_connected and self.controller_connected:
-            self.start_pressure_btn.config(state="normal" if not self.pressure_control_running else "disabled")
-            self.stop_pressure_btn.config(state="normal" if self.pressure_control_running else "disabled")
+            start_btn.config(state="normal" if not self.pressure_control_running else "disabled")
+            stop_btn.config(state="normal" if self.pressure_control_running else "disabled")
         else:
-            self.start_pressure_btn.config(state="disabled")
-            self.stop_pressure_btn.config(state="disabled")
+            start_btn.config(state="disabled")
+            stop_btn.config(state="disabled")
+
+    def _refresh_pressure_button_states(self):
+        try:
+            self.call_in_ui(self.update_button_states)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"刷新压力控制按钮状态失败: {exc}")
 
     def _refresh_connection_dependent_controls(self):
         controls = [
@@ -3383,12 +3586,17 @@ class App(ttk.Frame):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.config(state=state)
-        self.update_button_states()
+        self._refresh_pressure_button_states()
 
     def shutdown(self, destroy_window: bool | None = None):
         """统一的关闭流程：可在嵌入/独立模式中复用。"""
         if destroy_window is None:
             destroy_window = self._owns_window
+
+        try:
+            self._cancel_periodic_jobs()
+        except Exception:
+            pass
 
         try:
             try:
@@ -4425,6 +4633,11 @@ class App(ttk.Frame):
     # --- 放在 class App 内部 ---
     def _cleanup_ports(self):
         """兜底释放：先停循环与线程，再让驱动释放串口句柄。可安全重复调用。"""
+        try:
+            self._cancel_periodic_jobs()
+        except Exception:
+            pass
+
         # 防重复清理
         if getattr(self, "_cleaning", False):
             return
