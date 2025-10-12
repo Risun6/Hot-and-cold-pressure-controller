@@ -57,7 +57,11 @@ class UnifiedController(ttk.Window):
 
         self.temperature_app = TemperatureApp(temp_tab)
         self.pressure_app = PressureApp(press_tab)
-        self.sequence_app = MultiSequenceApp(seq_tab)
+        self.sequence_app = MultiSequenceApp(
+            seq_tab,
+            temp_controller=self.temperature_app,
+            pressure_controller=self.pressure_app,
+        )
 
         # 统一填充，使三个子界面都自适应可用空间
         for child in (self.temperature_app.container, self.pressure_app, self.sequence_app):

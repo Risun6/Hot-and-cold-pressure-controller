@@ -1,7 +1,7 @@
 import json
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import tkinter as tk
 import ttkbootstrap as ttk
@@ -27,17 +27,42 @@ REALTIME_REFRESH_S = 1.0
 
 
 class ControllerClient:
-    def __init__(self, host: str, port: int, name: str):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        name: str,
+        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        lock: Optional[threading.RLock] = None,
+    ):
         self.host = host
         self.port = port
         self.name = name
+        self._handler = handler
+        self._lock = lock or (threading.RLock() if handler else None)
 
     def _request(self, payload: Dict) -> Dict:
-        client = JSONLineClient(self.host, self.port, timeout=5.0)
-        response = client.request(payload)
-        if not response.get("ok", True):
-            raise RuntimeError(f"{self.name} 控制失败: {response.get('error', '未知错误')}")
-        return response
+        if self._handler:
+            lock = self._lock
+            if lock:
+                lock.acquire()
+            try:
+                result = self._handler(dict(payload))  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001 - surface to caller
+                result = {"ok": False, "error": str(exc)}
+            finally:
+                if lock:
+                    lock.release()
+            if result is None:
+                result = {}
+            if "ok" not in result:
+                result["ok"] = True
+        else:
+            client = JSONLineClient(self.host, self.port, timeout=5.0)
+            result = client.request(payload)
+        if not result.get("ok", True):
+            raise RuntimeError(f"{self.name} 控制失败: {result.get('error', '未知错误')}")
+        return result
 
     def ping(self) -> Dict:
         return self._request({"cmd": "ping"})
@@ -82,11 +107,23 @@ class ControllerClient:
 
 
 class SequenceRunner(threading.Thread):
-    def __init__(self, app: "MultiSequenceApp", plan: Dict):
+    def __init__(
+        self,
+        app: "MultiSequenceApp",
+        plan: Dict,
+        temp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        press_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        temp_lock: Optional[threading.RLock] = None,
+        press_lock: Optional[threading.RLock] = None,
+    ):
         super().__init__(daemon=True)
         self.app = app
         self.plan = plan
         self.stop_event = threading.Event()
+        self.temp_handler = temp_handler
+        self.press_handler = press_handler
+        self.temp_lock = temp_lock
+        self.press_lock = press_lock
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -286,8 +323,20 @@ class SequenceRunner(threading.Thread):
         self.app.add_result(result)
 
     def run(self) -> None:
-        temp_client = ControllerClient(self.plan["temp_host"], self.plan["temp_port"], "温控")
-        pressure_client = ControllerClient(self.plan["press_host"], self.plan["press_port"], "压力")
+        temp_client = ControllerClient(
+            self.plan["temp_host"],
+            self.plan["temp_port"],
+            "温控",
+            handler=self.temp_handler,
+            lock=self.temp_lock,
+        )
+        pressure_client = ControllerClient(
+            self.plan["press_host"],
+            self.plan["press_port"],
+            "压力",
+            handler=self.press_handler,
+            lock=self.press_lock,
+        )
         try:
             temp_client.ping()
             pressure_client.ping()
@@ -380,7 +429,12 @@ class SequenceRunner(threading.Thread):
 
 
 class MultiSequenceApp(ttk.Frame):
-    def __init__(self, master: Optional[tk.Misc] = None) -> None:
+    def __init__(
+        self,
+        master: Optional[tk.Misc] = None,
+        temp_controller: Optional[Any] = None,
+        pressure_controller: Optional[Any] = None,
+    ) -> None:
         if master is None:
             window = ttk.Window(themename="cosmo")
             master_widget: tk.Misc = window
@@ -403,6 +457,11 @@ class MultiSequenceApp(ttk.Frame):
             self._window.geometry("960x720")
         if hasattr(self._window, "protocol"):
             self._window.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._temp_handler = getattr(temp_controller, "_handle_tcp_command", None)
+        self._press_handler = getattr(pressure_controller, "_handle_tcp_command", None)
+        self._temp_handler_lock = threading.RLock() if self._temp_handler else None
+        self._press_handler_lock = threading.RLock() if self._press_handler else None
 
         self.temperature_vars: List[tk.StringVar] = []
         self.current_vars: List[tk.StringVar] = []
@@ -668,7 +727,14 @@ class MultiSequenceApp(ttk.Frame):
         self.log_text.delete("1.0", tk.END)
         self.reset_matrix_statuses()
         self.log("开始执行测试计划…")
-        self.runner = SequenceRunner(self, plan)
+        self.runner = SequenceRunner(
+            self,
+            plan,
+            temp_handler=self._temp_handler,
+            press_handler=self._press_handler,
+            temp_lock=self._temp_handler_lock,
+            press_lock=self._press_handler_lock,
+        )
         self.runner.start()
 
     def stop_plan(self) -> None:
@@ -714,8 +780,20 @@ class MultiSequenceApp(ttk.Frame):
 
         def worker() -> None:
             while not self._rt_stop.is_set():
-                temp_status = self._fetch_status(TEMP_DEFAULT_HOST, TEMP_DEFAULT_PORT, "温控")
-                press_status = self._fetch_status(PRESS_DEFAULT_HOST, PRESS_DEFAULT_PORT, "压力")
+                temp_status = self._fetch_status(
+                    TEMP_DEFAULT_HOST,
+                    TEMP_DEFAULT_PORT,
+                    "温控",
+                    handler=self._temp_handler,
+                    lock=self._temp_handler_lock,
+                )
+                press_status = self._fetch_status(
+                    PRESS_DEFAULT_HOST,
+                    PRESS_DEFAULT_PORT,
+                    "压力",
+                    handler=self._press_handler,
+                    lock=self._press_handler_lock,
+                )
                 with self._rt_lock:
                     self._rt_latest = (temp_status, press_status, time.time())
                 if self._rt_stop.wait(REALTIME_REFRESH_S):
@@ -725,9 +803,17 @@ class MultiSequenceApp(ttk.Frame):
         self._rt_thread.start()
         self.after(500, self._update_realtime_ui)
 
-    def _fetch_status(self, host: str, port: int, name: str) -> Optional[Dict]:
+    def _fetch_status(
+        self,
+        host: str,
+        port: int,
+        name: str,
+        *,
+        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        lock: Optional[threading.RLock] = None,
+    ) -> Optional[Dict]:
         try:
-            client = ControllerClient(host, port, name)
+            client = ControllerClient(host, port, name, handler=handler, lock=lock)
             resp = client.status()
             return resp.get("status")
         except Exception as exc:

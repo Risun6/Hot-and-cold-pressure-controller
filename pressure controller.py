@@ -453,7 +453,7 @@ class App(ttk.Frame):
         self.pressure_thread_running = False
         self.position_thread_running = False
 
-        self.after(500, lambda: self.state("zoomed"))
+        self.after(500, self._maximize_window)
         self.pressure_control_paused_until = 0
 
         # —— 运动命令节流（避免每50ms狂发）——
@@ -533,6 +533,27 @@ class App(ttk.Frame):
         if "error" in result:
             raise result["error"]
         return result.get("value")
+
+    def _maximize_window(self):
+        if not getattr(self, "_owns_window", False):
+            return
+        window = getattr(self, "_window", None)
+        if not window:
+            return
+        for attr in ("state", "wm_state"):
+            method = getattr(window, attr, None)
+            if callable(method):
+                try:
+                    method("zoomed")
+                    return
+                except tk.TclError:
+                    continue
+        attributes = getattr(window, "attributes", None)
+        if callable(attributes):
+            try:
+                attributes("-zoomed", True)
+            except tk.TclError:
+                pass
 
     def create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
