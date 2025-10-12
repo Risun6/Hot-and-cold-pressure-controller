@@ -50,13 +50,13 @@ class UnifiedController(ttk.Window):
         left_panel = ttk.Frame(paned)
         right_panel = ttk.Labelframe(paned, text="日志", padding=8)
 
-        paned.add(left_panel, weight=4)
-        paned.add(right_panel, weight=2)
+        paned.add(left_panel, weight=6)
+        paned.add(right_panel, weight=1)
 
         self.notebook = ttk.Notebook(left_panel, padding=8)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.log_text = scrolledtext.ScrolledText(right_panel, state="disabled", width=48)
+        self.log_text = scrolledtext.ScrolledText(right_panel, state="disabled", width=36)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self._log_lock = threading.Lock()
 
@@ -92,6 +92,7 @@ class UnifiedController(ttk.Window):
                 pass
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._maximize_window)
 
     def append_log(self, message: str) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -118,6 +119,22 @@ class UnifiedController(ttk.Window):
             except Exception:
                 pass
         self.destroy()
+
+    def _maximize_window(self) -> None:
+        for attr in ("state", "wm_state"):
+            method = getattr(self, attr, None)
+            if callable(method):
+                try:
+                    method("zoomed")
+                    return
+                except tk.TclError:
+                    continue
+        attributes = getattr(self, "attributes", None)
+        if callable(attributes):
+            try:
+                attributes("-zoomed", True)
+            except tk.TclError:
+                pass
 
 
 def main() -> None:
