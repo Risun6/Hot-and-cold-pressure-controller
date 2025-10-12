@@ -493,12 +493,6 @@ class App(ttk.Frame):
             ttk.Button(toolbar, text="停止全部", command=self.stop_all, bootstyle="warning-outline").pack(
                 side=tk.LEFT, padx=12
             )
-            ttk.Button(toolbar, text="使用说明", command=self.show_instructions, bootstyle="info-link").pack(
-                side=tk.RIGHT, padx=4
-            )
-            ttk.Button(toolbar, text="关于", command=self.show_about, bootstyle="info-link").pack(
-                side=tk.RIGHT, padx=4
-            )
             return
 
         menubar = Menu(self._window)
@@ -509,11 +503,6 @@ class App(ttk.Frame):
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_closing)
         menubar.add_cascade(label="文件", menu=file_menu)
-
-        help_menu = Menu(menubar, tearoff=0)
-        help_menu.add_command(label="使用说明", command=self.show_instructions)
-        help_menu.add_command(label="关于", command=self.show_about)
-        menubar.add_cascade(label="帮助", menu=help_menu)
 
         self._window.config(menu=menubar)
 
