@@ -1032,8 +1032,8 @@ class App(ttk.Frame):
         self.ax2 = self.ax.twinx()
         self.init_plot_style()
 
-        self.line_pos, = self.ax.plot([], [], color='#268bd2', linewidth=2.1, label='位置 (mm)')
-        self.line_press, = self.ax2.plot([], [], color='#e74c3c', linewidth=2.1, label=f'压力 ({self.current_unit})')
+        self.line_pos, = self.ax.plot([], [], color='#268bd2', linewidth=2.1, label='Position (mm)')
+        self.line_press, = self.ax2.plot([], [], color='#e74c3c', linewidth=2.1, label=f'Pressure ({self.current_unit})')
 
         self.ax.legend(loc='upper left', fontsize=10, frameon=False, borderpad=0.3, labelspacing=0.2)
         self.ax2.legend(loc='upper right', fontsize=10, frameon=False, borderpad=0.3, labelspacing=0.2)
@@ -1046,19 +1046,19 @@ class App(ttk.Frame):
         chart_btn_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # 新增：显示时长(s) 输入框（0 = 不限制）
-        ttk.Label(chart_btn_frame, text="显示时长(s):").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(chart_btn_frame, text="Display Duration (s):").pack(side=tk.LEFT, padx=(0, 4))
         self.plot_window_seconds_var = tk.DoubleVar(value=30.0)  # 默认 30 秒，只显示最近 30s 数据
         self.plot_window_entry = ttk.Entry(chart_btn_frame, textvariable=self.plot_window_seconds_var, width=7)
         self.plot_window_entry.pack(side=tk.LEFT, padx=(0, 10))
 
         self.export_btn = ttk.Button(
-            chart_btn_frame, text="导出图表",
+            chart_btn_frame, text="Export Chart",
             command=self.export_chart, state="disabled", bootstyle="info"
         )
         self.export_btn.pack(side=tk.LEFT, padx=5, pady=2)
 
         self.clear_chart_btn = ttk.Button(
-            chart_btn_frame, text="清除图表",
+            chart_btn_frame, text="Clear Chart",
             command=self.clear_chart, bootstyle="warning"
         )
         self.clear_chart_btn.pack(side=tk.LEFT, padx=5, pady=2)
@@ -3087,10 +3087,10 @@ class App(ttk.Frame):
 
             self.ax.relim(); self.ax.autoscale_view()
             self.ax2.relim(); self.ax2.autoscale_view()
-            self.ax2.set_ylabel(f"压力 ({self.current_unit})", color='#e74c3c')
+            self.ax2.set_ylabel(f"Pressure ({self.current_unit})", color='#e74c3c')
             self.canvas.draw_idle()
         except Exception as e:
-            self.log(f"更新图表错误: {e}")
+            self.log(f"Chart update error: {e}")
 
     def save_session_data(self):
         if not self.time_data or not self.pos_data or not self.pressure_data:
@@ -3101,7 +3101,7 @@ class App(ttk.Frame):
         try:
             with open(file_path, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(["时间 (秒)", "位置 (mm)", "压力 (g)"])
+                writer.writerow(["Time (s)", "Position (mm)", "Pressure (g)"])
                 for i in range(len(self.time_data)):
                     writer.writerow([self.time_data[i], self.pos_data[i], self.pressure_data[i]])
             self.log(f"会话数据已保存到 {file_path}")
@@ -3110,7 +3110,7 @@ class App(ttk.Frame):
 
     def export_chart(self):
         if not self.time_data or not self.pos_data or not self.pressure_data:
-            messagebox.showerror("错误", "没有数据可供导出")
+            messagebox.showerror("Error", "No data available for export.")
             return
         try:
             chart_path = "temp_chart.png"
@@ -3122,15 +3122,15 @@ class App(ttk.Frame):
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".xlsx",
                 filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-                title="保存图表到Excel"
+                title="Save Chart to Excel"
             )
             if file_path:
                 workbook.save(file_path)
-                self.log(f"图表已导出到 {file_path}")
+                self.log(f"Chart exported to {file_path}")
             if os.path.exists(chart_path):
                 os.remove(chart_path)
         except Exception as e:
-            messagebox.showerror("错误", f"导出图表失败: {e}")
+            messagebox.showerror("Error", f"Failed to export chart: {e}")
 
     def reset_chart(self):
         self.time_data.clear()
@@ -3141,10 +3141,10 @@ class App(ttk.Frame):
         self.ax.relim(); self.ax.autoscale_view()
         self.ax2.relim(); self.ax2.autoscale_view()
         self.canvas.draw_idle()
-        self.log("图表已清空")
+        self.log("Chart cleared")
 
     def clear_chart(self):
-        if messagebox.askyesno("确认清除", "是否清除所有图表数据？"):
+        if messagebox.askyesno("Confirm", "Clear all chart data?"):
             self.reset_chart()
 
     def tare_pressure(self):
@@ -3756,10 +3756,10 @@ class App(ttk.Frame):
             self.after(500, lambda: self.indicator_canvas.itemconfig(self.indicator_circle, fill="red"))
 
     def init_plot_style(self):
-        self.ax.set_xlabel("时间 (s)")
-        self.ax.set_ylabel("位置 (mm)", color='#268bd2')
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Position (mm)", color='#268bd2')
         self.ax.tick_params(axis='y', labelcolor='#268bd2')
-        self.ax2.set_ylabel(f"压力 ({self.current_unit})", color='#e74c3c')
+        self.ax2.set_ylabel(f"Pressure ({self.current_unit})", color='#e74c3c')
         self.ax2.tick_params(axis='y', labelcolor='#e74c3c')
         self.ax.grid(True, linestyle='--', alpha=0.6)
 
