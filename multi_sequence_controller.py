@@ -1,14 +1,16 @@
+import csv
 import json
 import math
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from tkinter import messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -33,6 +35,28 @@ DEFAULT_CELL_TIMEOUT = 300.0
 DEFAULT_CONFIRM_COUNT = 2
 REALTIME_REFRESH_S = 1.0
 CHART_HISTORY_SECONDS = 300.0
+
+CONFIG_DIRNAME = "PID_冷热台"
+
+
+def resolve_documents_dir() -> Path:
+    home = Path.home()
+    candidates = [
+        home / "Documents",
+        home / "文档",
+        home / "OneDrive" / "Documents",
+        home / "OneDrive" / "文档",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return home
+
+
+def get_logs_dir() -> Path:
+    root = resolve_documents_dir() / CONFIG_DIRNAME / "logs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 class ControllerClient:
@@ -330,6 +354,7 @@ class SequenceRunner(threading.Thread):
             "status": "completed",
         }
         self.app.add_result(result)
+        self.app.append_csv_record(result)
 
     def _maybe_sim_click(self) -> None:
         cfg = self.plan.get("sim_click")
@@ -516,6 +541,13 @@ class MultiSequenceApp(ttk.Frame):
         self.realtime_timestamp_var = tk.StringVar(value="--")
         self.realtime_status_var = tk.StringVar(value="")
 
+        self.csv_dir = tk.StringVar(value=str(get_logs_dir()))
+        self._csv_lock = threading.Lock()
+        self._csv_file: Optional[Any] = None
+        self._csv_writer: Optional[csv.writer] = None
+        self._csv_path: Optional[Path] = None
+        self._csv_has_data = False
+
         self.sim_click_enabled = tk.BooleanVar(value=False)
         self.sim_click_delay_var = tk.IntVar(value=0)
         self.sim_click_repeat_var = tk.IntVar(value=2)
@@ -590,6 +622,26 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(opt_row, text="说明：采用固定判稳阈值自动复检，超时将标记为红色并跳过。", bootstyle=INFO).pack(
             side=tk.LEFT, padx=8
         )
+
+        record_frame = ttk.Labelframe(main, text="数据记录（CSV 导出）")
+        record_frame.pack(fill=tk.X, pady=8)
+        record_row = ttk.Frame(record_frame)
+        record_row.pack(fill=tk.X, pady=4)
+        ttk.Label(record_row, text="保存目录").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(record_row, textvariable=self.csv_dir, width=48).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            record_row,
+            text="选择目录",
+            command=self._choose_csv_dir,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            record_frame,
+            text="规则：点击“开始执行”新建文件，任务结束后自动保存。",
+            bootstyle=INFO,
+            wraplength=680,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
         click_row = ttk.Frame(options_frame)
         click_row.pack(fill=tk.X, pady=4)
@@ -854,6 +906,190 @@ class MultiSequenceApp(ttk.Frame):
         else:
             self.sim_click_display_var.set("未设置")
 
+    def _choose_csv_dir(self) -> None:
+        current = self.csv_dir.get().strip() or str(get_logs_dir())
+        selected = filedialog.askdirectory(initialdir=current, title="选择 CSV 保存目录")
+        if selected:
+            path = Path(selected)
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                messagebox.showerror("错误", f"创建目录失败：{exc}")
+                return
+            self.csv_dir.set(str(path))
+            self.log(f"CSV 保存目录已设置为 {path}")
+
+    @staticmethod
+    def _format_csv_number(value: Optional[float]) -> str:
+        if value is None:
+            return ""
+        try:
+            return f"{float(value):.6f}"
+        except Exception:
+            return ""
+
+    def _open_csv_session(self) -> bool:
+        self._close_csv_session(log=False)
+        base = self.csv_dir.get().strip()
+        if not base:
+            base_path = get_logs_dir()
+        else:
+            base_path = Path(base).expanduser()
+        try:
+            base_path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("错误", f"创建目录失败：{exc}")
+            return False
+        filename = time.strftime("multi_sequence_%Y%m%d_%H%M%S.csv")
+        file_path = base_path / filename
+        try:
+            handle = open(file_path, "w", newline="", encoding="utf-8-sig")
+        except Exception as exc:
+            messagebox.showerror("错误", f"创建 CSV 文件失败：{exc}")
+            return False
+        writer = csv.writer(handle)
+        header = [
+            "timestamp",
+            "row",
+            "column",
+            "temperature_plan",
+            "temperature_target",
+            "temperature_actual",
+            "temperature_error",
+            "temperature_mae",
+            "pressure_plan",
+            "pressure_target",
+            "pressure_actual",
+            "pressure_error",
+            "pressure_mae",
+        ]
+        try:
+            writer.writerow(header)
+            handle.flush()
+        except Exception as exc:
+            handle.close()
+            messagebox.showerror("错误", f"写入 CSV 失败：{exc}")
+            return False
+        with self._csv_lock:
+            self._csv_file = handle
+            self._csv_writer = writer
+            self._csv_path = file_path
+            self._csv_has_data = False
+        self.log(f"数据记录开始：{file_path}")
+        return True
+
+    def _close_csv_session(self, *, log: bool = True) -> None:
+        with self._csv_lock:
+            handle = self._csv_file
+            path = self._csv_path
+            has_data = self._csv_has_data
+            self._csv_file = None
+            self._csv_writer = None
+            self._csv_path = None
+            self._csv_has_data = False
+        if not handle:
+            return
+        try:
+            handle.flush()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+        if not path:
+            return
+        if not has_data:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                if log:
+                    self.log(f"CSV 文件删除失败：{exc}")
+            else:
+                if log:
+                    self.log("测试未产生有效数据，已删除空的 CSV 文件")
+        elif log:
+            self.log(f"数据记录已保存到 {path}")
+
+    def append_csv_record(self, result: Dict[str, Any]) -> None:
+        with self._csv_lock:
+            writer = self._csv_writer
+            handle = self._csv_file
+            path = self._csv_path
+        if not writer or not handle or not path:
+            return
+        timestamp = result.get("timestamp")
+        if not isinstance(timestamp, (int, float)):
+            timestamp = time.time()
+        timestamp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+        row_idx = result.get("row")
+        col_idx = result.get("col")
+        if isinstance(row_idx, int):
+            row_display: Any = row_idx + 1
+        else:
+            row_display = ""
+        if isinstance(col_idx, int):
+            col_display: Any = col_idx + 1
+        else:
+            col_display = ""
+
+        temp_plan = self._coerce_float(result.get("temperature"))
+        temp_status = result.get("temp_status") or {}
+        temp_target = self._coerce_float(temp_status.get("target"))
+        temp_actual = self._coerce_float(temp_status.get("temperature"))
+        temp_error = self._coerce_float(temp_status.get("error"))
+        temp_mae = self._coerce_float(temp_status.get("mae"))
+
+        press_plan = self._coerce_float(result.get("pressure", result.get("current")))
+        press_status = result.get("pressure_status") or {}
+        press_target = self._coerce_float(press_status.get("target"))
+        press_actual = None
+        if isinstance(press_status, dict):
+            feedback_value = self._extract_pressure_value(press_status)
+            if feedback_value is None:
+                feedback_value = press_status.get("pressure")
+            press_actual = self._coerce_float(feedback_value)
+        press_error = None
+        if isinstance(press_status, dict):
+            last = press_status.get("last") if isinstance(press_status.get("last"), dict) else None
+            if last and last.get("error") is not None:
+                press_error = self._coerce_float(last.get("error"))
+            elif press_status.get("error") is not None:
+                press_error = self._coerce_float(press_status.get("error"))
+        press_mae = self._coerce_float(press_status.get("mae"))
+
+        row_data = [
+            timestamp_str,
+            row_display,
+            col_display,
+            self._format_csv_number(temp_plan),
+            self._format_csv_number(temp_target),
+            self._format_csv_number(temp_actual),
+            self._format_csv_number(temp_error),
+            self._format_csv_number(temp_mae),
+            self._format_csv_number(press_plan),
+            self._format_csv_number(press_target),
+            self._format_csv_number(press_actual),
+            self._format_csv_number(press_error),
+            self._format_csv_number(press_mae),
+        ]
+
+        with self._csv_lock:
+            writer = self._csv_writer
+            handle = self._csv_file
+            if not writer or not handle:
+                return
+            try:
+                writer.writerow(row_data)
+                handle.flush()
+                self._csv_has_data = True
+            except Exception as exc:
+                # 记录错误但不中断执行
+                err_msg = f"写入 CSV 失败：{exc}"
+                self.after(0, lambda m=err_msg: self.log(m))
+
     def start_plan(self) -> None:
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("提示", "任务正在运行")
@@ -862,6 +1098,8 @@ class MultiSequenceApp(ttk.Frame):
             plan = self.build_plan()
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc))
+            return
+        if not self._open_csv_session():
             return
         self.results.clear()
         if self.log_text:
@@ -886,6 +1124,7 @@ class MultiSequenceApp(ttk.Frame):
     def on_runner_finished(self) -> None:
         self.runner = None
         self.log("测试计划已结束")
+        self._close_csv_session()
 
     def export_results(self) -> None:
         if not self.results:
@@ -1138,6 +1377,7 @@ class MultiSequenceApp(ttk.Frame):
                 self._rt_thread.join(timeout=1.0)
             except Exception:
                 pass
+        self._close_csv_session()
         target = self._window if destroy_window else self
         try:
             target.destroy()
