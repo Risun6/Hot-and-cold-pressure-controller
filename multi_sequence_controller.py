@@ -9,6 +9,7 @@ from ttkbootstrap.constants import *
 from tkinter import messagebox, scrolledtext
 
 from tcp_utils import JSONLineClient
+from sim_click import capture_click_point, perform_click_async
 
 
 TEMP_DEFAULT_HOST = "127.0.0.1"
@@ -322,6 +323,32 @@ class SequenceRunner(threading.Thread):
         }
         self.app.add_result(result)
 
+    def _maybe_sim_click(self) -> None:
+        cfg = self.plan.get("sim_click")
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return
+        point = cfg.get("point")
+        if not point or len(point) != 2:
+            self.log("模拟点击点未设置，跳过点击")
+            return
+        try:
+            repeat = max(1, int(cfg.get("repeat", 1)))
+        except Exception:
+            repeat = 1
+        try:
+            delay_ms = max(0, int(cfg.get("delay_ms", 0)))
+        except Exception:
+            delay_ms = 0
+        try:
+            cooldown_ms = max(0, int(cfg.get("cooldown_ms", 0)))
+        except Exception:
+            cooldown_ms = 0
+        for idx in range(repeat):
+            perform_click_async(int(point[0]), int(point[1]), delay_ms=delay_ms, reporter=self.log)
+            if cooldown_ms and idx < repeat - 1:
+                if self.stop_event.wait(cooldown_ms / 1000.0):
+                    break
+
     def run(self) -> None:
         temp_client = ControllerClient(
             self.plan["temp_host"],
@@ -397,6 +424,7 @@ class SequenceRunner(threading.Thread):
                             self.app.mark_cell_timeout(row, col, "压力超时")
                             continue
                         break
+                    self._maybe_sim_click()
                     temp_recheck, temp_recheck_timeout = self.wait_temperature(
                         temp_client,
                         t_thr,
@@ -480,6 +508,17 @@ class MultiSequenceApp(ttk.Frame):
         self.realtime_timestamp_var = tk.StringVar(value="--")
         self.realtime_status_var = tk.StringVar(value="")
 
+        self.sim_click_enabled = tk.BooleanVar(value=False)
+        self.sim_click_delay_var = tk.IntVar(value=0)
+        self.sim_click_repeat_var = tk.IntVar(value=2)
+        self.sim_click_cooldown_var = tk.IntVar(value=500)
+        self.sim_click_pos: Optional[Tuple[int, int]] = None
+        self.sim_click_display_var = tk.StringVar(value="未设置")
+
+        self._external_log: Optional[Callable[[str], None]] = None
+        self._use_internal_log = self._owns_window
+        self.log_text: Optional[scrolledtext.ScrolledText] = None
+
         self.runner: Optional[SequenceRunner] = None
         self.results: List[Dict] = []
 
@@ -533,6 +572,20 @@ class MultiSequenceApp(ttk.Frame):
             side=tk.LEFT, padx=8
         )
 
+        click_row = ttk.Frame(options_frame)
+        click_row.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(click_row, text="稳定后执行模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=4)
+        ttk.Button(click_row, text="设置点击点", command=self.set_sim_click_point, bootstyle="outline-info").pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Label(click_row, textvariable=self.sim_click_display_var, bootstyle=SECONDARY).pack(side=tk.LEFT, padx=6)
+        ttk.Label(click_row, text="延时(ms)").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(click_row, textvariable=self.sim_click_delay_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(click_row, text="重复次数").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(click_row, textvariable=self.sim_click_repeat_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(click_row, text="间隔(ms)").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(click_row, textvariable=self.sim_click_cooldown_var, width=7).pack(side=tk.LEFT)
+
         realtime_frame = ttk.Labelframe(main, text="实时状态（来自温度/压力控制程序）")
         realtime_frame.pack(fill=tk.X, pady=8)
 
@@ -568,10 +621,11 @@ class MultiSequenceApp(ttk.Frame):
             side=tk.RIGHT, padx=4
         )
 
-        log_frame = ttk.Labelframe(main, text="日志")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=8)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        if self._use_internal_log:
+            log_frame = ttk.Labelframe(main, text="日志")
+            log_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+            self.log_text = scrolledtext.ScrolledText(log_frame, height=15)
+            self.log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
     # Matrix helpers ------------------------------------------------------
     def _init_default_matrix(self) -> None:
@@ -700,6 +754,28 @@ class MultiSequenceApp(ttk.Frame):
             "press_hold": DEFAULT_PRESS_HOLD,
             "repeat_confirm": confirm_need,
         }
+        try:
+            delay_ms = max(0, int(self.sim_click_delay_var.get()))
+        except Exception:
+            delay_ms = 0
+        try:
+            repeat = max(1, int(self.sim_click_repeat_var.get()))
+        except Exception:
+            repeat = 1
+        try:
+            cooldown = max(0, int(self.sim_click_cooldown_var.get()))
+        except Exception:
+            cooldown = 0
+        sim_enabled = bool(self.sim_click_enabled.get())
+        if sim_enabled and not self.sim_click_pos:
+            raise ValueError("请先设置模拟点击点")
+        plan["sim_click"] = {
+            "enabled": sim_enabled,
+            "point": list(self.sim_click_pos) if self.sim_click_pos else None,
+            "delay_ms": delay_ms,
+            "repeat": repeat,
+            "cooldown_ms": cooldown,
+        }
         return plan
 
     def _collect_numbers(self, vars_list: List[tk.StringVar], name: str) -> List[float]:
@@ -714,6 +790,19 @@ class MultiSequenceApp(ttk.Frame):
                 raise ValueError(f"{name}第 {idx} 项格式错误：{text}") from None
         return values
 
+    def set_sim_click_point(self) -> None:
+        pos = capture_click_point(
+            self,
+            title="设置模拟点击点",
+            hint="移动鼠标到目标软件按钮处，按 Enter 键记录",
+            reporter=self.log,
+        )
+        if pos:
+            self.sim_click_pos = (int(pos[0]), int(pos[1]))
+            self.sim_click_display_var.set(f"{int(pos[0])}, {int(pos[1])}")
+        else:
+            self.sim_click_display_var.set("未设置")
+
     def start_plan(self) -> None:
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("提示", "任务正在运行")
@@ -724,7 +813,8 @@ class MultiSequenceApp(ttk.Frame):
             messagebox.showerror("参数错误", str(exc))
             return
         self.results.clear()
-        self.log_text.delete("1.0", tk.END)
+        if self.log_text:
+            self.log_text.delete("1.0", tk.END)
         self.reset_matrix_statuses()
         self.log("开始执行测试计划…")
         self.runner = SequenceRunner(
@@ -757,12 +847,24 @@ class MultiSequenceApp(ttk.Frame):
 
     # Logging -------------------------------------------------------------
     def log(self, message: str) -> None:
+        if callable(self._external_log):
+            try:
+                self._external_log(message)
+            except Exception:
+                pass
+        if not self._use_internal_log or not self.log_text:
+            return
+
         timestamp = time.strftime("%H:%M:%S")
+
         def append() -> None:
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.log_text.see(tk.END)
 
         self.after(0, append)
+
+    def set_external_logger(self, callback: Callable[[str], None]) -> None:
+        self._external_log = callback
 
     def add_result(self, result: Dict) -> None:
         self.results.append(result)

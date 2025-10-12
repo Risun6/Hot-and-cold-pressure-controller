@@ -20,6 +20,7 @@ from tkinter import messagebox
 import serial.tools.list_ports
 
 from tcp_utils import JSONLineServer
+from sim_click import perform_click_async
 
 # ---- 可选依赖：鼠标/键盘 ----
 try:
@@ -3924,52 +3925,14 @@ class App:
             self._set_status("模拟点击被取消：坐标无效。")
             return
 
-        def _do_click_bg():
-            try:
-                # 可选延时
-                if delay_ms and delay_ms > 0:
-                    _time.sleep(delay_ms / 1000.0)
-
-                # 执行点击（优先 pyautogui）
-                if pyautogui is not None:
-                    clicks = 2 if double else 1
-                    btn = button.lower().strip()
-                    if btn not in ("left", "right", "middle"):
-                        btn = "left"
-                    pyautogui.click(x=int(x), y=int(y), clicks=clicks, button=btn)
-                else:
-                    if not sys.platform.startswith("win"):
-                        raise RuntimeError("缺少 pyautogui 且非 Windows，无法模拟点击。")
-                    user32 = ctypes.windll.user32
-                    user32.SetCursorPos(int(x), int(y))
-                    MOUSEEVENTF_LEFTDOWN = 0x0002;
-                    MOUSEEVENTF_LEFTUP = 0x0004
-                    MOUSEEVENTF_RIGHTDOWN = 0x0008;
-                    MOUSEEVENTF_RIGHTUP = 0x0010
-                    MOUSEEVENTF_MIDDLEDOWN = 0x0020;
-                    MOUSEEVENTF_MIDDLEUP = 0x0040
-                    btn = button.lower().strip()
-                    if btn == "right":
-                        down, up = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
-                    elif btn == "middle":
-                        down, up = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-                    else:
-                        down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
-                    user32.mouse_event(down, 0, 0, 0, 0)
-                    user32.mouse_event(up, 0, 0, 0, 0)
-                    if double:
-                        _time.sleep(0.03)
-                        user32.mouse_event(down, 0, 0, 0, 0)
-                        user32.mouse_event(up, 0, 0, 0, 0)
-
-                # 成功：回主线程更新状态
-                self._set_status(f"已模拟点击：({int(x)},{int(y)}) {button}{' 双击' if double else ''}")
-            except Exception as e:
-                self._set_status(f"模拟点击失败：{e}")
-
-        # 后台线程执行，确保 UI 不被阻塞
-        th = threading.Thread(target=_do_click_bg, daemon=True)
-        th.start()
+        perform_click_async(
+            int(x),
+            int(y),
+            button=button,
+            double=double,
+            delay_ms=delay_ms,
+            reporter=self._set_status,
+        )
 
     def _try_auto_click_start(self):
         """在线性段开始（斜率跨阈）时尝试点击；无效坐标则跳过并自动关闭该功能。"""

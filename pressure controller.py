@@ -26,6 +26,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from tcp_utils import JSONLineServer
+from sim_click import capture_click_point, perform_click_async
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -266,6 +267,9 @@ class App(ttk.Frame):
 
         self._window = window
         self._embedded = not self._owns_window
+        self._external_log = None
+        self._use_internal_log = self._owns_window
+        self.log_text = None
 
         if self._owns_window:
             try:
@@ -1067,10 +1071,11 @@ class App(ttk.Frame):
         )
         self.clear_chart_btn.pack(side=tk.LEFT, padx=5, pady=2)
 
-        log_frame = ttk.LabelFrame(right_panel, text="日志")
-        log_frame.pack(fill=tk.BOTH, padx=5, pady=5)
-        self.log_text = scrolledtext.ScrolledText(log_frame, state="disabled", height=10)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        if self._use_internal_log:
+            log_frame = ttk.LabelFrame(right_panel, text="日志")
+            log_frame.pack(fill=tk.BOTH, padx=5, pady=5)
+            self.log_text = scrolledtext.ScrolledText(log_frame, state="disabled", height=10)
+            self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.refresh_ports()
 
@@ -1081,25 +1086,14 @@ class App(ttk.Frame):
             self.after(500, lambda: self.set_indicator_color("red"))
 
     def set_sim_click_point(self):
-        messagebox.showinfo("设置点击点", "移动鼠标到目标软件按钮处，按Enter键记录。")
-
-        top = tk.Toplevel(self)
-        top.title("请切换到目标点，按Enter记录")
-        top.geometry("300x100")
-
-        label = tk.Label(top, text="移动鼠标到目标点，然后按Enter")
-        label.pack(pady=20)
-
-        def on_enter(event=None):
-            pos = pyautogui.position()
+        pos = capture_click_point(
+            self,
+            title="设置点击点",
+            hint="移动鼠标到目标软件按钮处，按 Enter 键记录",
+            reporter=self.log,
+        )
+        if pos:
             self.sim_click_pos = pos
-            self.log(f"已记录模拟点击点: {pos}")
-            top.destroy()
-
-        top.bind('<Return>', on_enter)
-        top.grab_set()
-        top.focus_set()
-        top.wait_window()
 
     def set_pixel_detection_region(self):
         messagebox.showinfo("设置检测区域", "请用鼠标框选需要检测的屏幕区域，按 Enter 键确认。")
@@ -1912,30 +1906,31 @@ class App(ttk.Frame):
             self.log("自动连接成功")
 
     def log(self, message):
-        # —— 让从子线程调用也安全：丢到 Tk 主线程再写 UI —— #
+        if callable(self._external_log):
+            try:
+                self._external_log(message)
+            except Exception:
+                pass
+        if not self._use_internal_log or not self.log_text:
+            return
+
         import threading, time
         if threading.current_thread() is not threading.main_thread():
             self.after(0, lambda m=message: self.log(m))
             return
 
-        if not hasattr(self, "log_text"):
-            return  # 还没创建日志控件就先跳过
-
         ts = time.strftime('%H:%M:%S')
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"{ts} - {message}\n")
 
-        # —— 只保留最后 self.LOG_MAX_LINES 行 —— #
         try:
             max_lines = int(getattr(self, "LOG_MAX_LINES", 200))
         except Exception:
             max_lines = 200
 
-        # Tk Text 的行号：'end-1c' 是最后一个字符位置
         line_count = int(self.log_text.index('end-1c').split('.')[0])
         if line_count > max_lines:
             excess = line_count - max_lines
-            # 删除前 excess 行（从第1行的行首到第 excess+1 行的行首）
             self.log_text.delete('1.0', f'{excess + 1}.0')
 
         self.log_text.see("end")
@@ -3745,16 +3740,15 @@ class App(ttk.Frame):
         self.pixel_detection_enabled.set(False)
         self.sim_click_enabled.set(False)
 
-    def perform_sim_click(self):
+    def perform_sim_click(self, *, double: bool = False, delay_ms: int = 0):
         if not self.sim_click_pos:
             self.log("模拟点击点未设置，跳过点击")
             return
         x, y = self.sim_click_pos
-        try:
-            pyautogui.click(x, y)
-            self.log(f"已模拟点击: ({x}, {y})")
-        except Exception as e:
-            self.log(f"执行模拟点击失败: {e}")
+        perform_click_async(int(x), int(y), double=double, delay_ms=delay_ms, reporter=self.log)
+
+    def set_external_logger(self, callback):
+        self._external_log = callback
 
     def start_machine_quiet(self):
         """直接下发启动寄存器（无弹窗），带禁启窗口。"""
