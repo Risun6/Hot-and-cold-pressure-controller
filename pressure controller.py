@@ -66,6 +66,8 @@ def calculate_crc(data: bytes) -> bytes:
 TCP_HOST = "127.0.0.1"
 TCP_PORT = 50020
 
+LEFT_PANEL_WIDTH = 760
+
 
 class ModbusController:
     """
@@ -318,6 +320,7 @@ class App(ttk.Frame):
         self.pressure_data = []
         self._pressure_history_lock = threading.Lock()
         self._pressure_history = deque()
+        self._auto_tare_prompted = False
         self._history_max_seconds = 1800.0
         self.time_start = time.time()
         self.min_pressure = float('inf')
@@ -552,7 +555,7 @@ class App(ttk.Frame):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_panel_frame = ttk.LabelFrame(main_frame, text="控制面板", width=600)
+        left_panel_frame = ttk.LabelFrame(main_frame, text="控制面板", width=LEFT_PANEL_WIDTH)
         left_panel_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10), pady=0)
         left_panel_frame.pack_propagate(False)
 
@@ -634,7 +637,7 @@ class App(ttk.Frame):
             lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all"))
         )
 
-        left_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw", width=580)
+        left_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw", width=LEFT_PANEL_WIDTH - 20)
         left_canvas.configure(yscrollcommand=scrollbar.set)
 
         self.scrollable_frame.bind("<Enter>", lambda e: self.scrollable_frame.bind_all("<MouseWheel>", lambda
@@ -709,9 +712,9 @@ class App(ttk.Frame):
                                    state="disabled", bootstyle="primary")
         self.jump_btn.grid(row=1, column=2, padx=5, pady=2, sticky='ew')
 
-        self.stop_btn = ttk.Button(ctrl_btn_frame, text="停止", width=btn_width,
-                                   command=self.stop_all,
-                                   state="disabled", bootstyle="danger")
+        self.stop_btn = ttk.Button(ctrl_btn_frame, text="停止运动", width=btn_width,
+                                    command=self.stop_all,
+                                    state="disabled", bootstyle="danger")
         self.stop_btn.grid(row=0, column=2, padx=5, pady=2, sticky='ew')
 
         for i in range(3):
@@ -772,8 +775,8 @@ class App(ttk.Frame):
 
         btn_frame = ttk.Frame(pressure_ctrl_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=8)
-        self.start_pressure_btn = ttk.Button(btn_frame, text="开始压力控制", command=self.start_pressure_control,
-                                             state="disabled", bootstyle="success")
+        self.start_pressure_btn = ttk.Button(btn_frame, text="启动压力控制", command=self.start_pressure_control,
+                                              state="disabled", bootstyle="success")
         self.start_pressure_btn.pack(side=tk.LEFT, padx=10)
         self.stop_pressure_btn = ttk.Button(btn_frame, text="停止压力控制", command=self.stop_pressure_control,
                                             state="disabled", bootstyle="danger")
@@ -896,7 +899,7 @@ class App(ttk.Frame):
 
         button_frame = ttk.Frame(multi_pressure_frame)
         button_frame.pack(padx=5, pady=5)
-        ttk.Button(button_frame, text="开始多压力测试", command=self.start_multi_pressure_test, bootstyle="success").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="启动多压力测试", command=self.start_multi_pressure_test, bootstyle="success").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(button_frame, text="停止多压力测试", command=self.stop_multi_pressure_test, bootstyle="danger").pack(side=tk.LEFT)
 
         # 跳变设置区  ————  用本段完整替换你原来的“跳变设置”区域  ————
@@ -1244,6 +1247,7 @@ class App(ttk.Frame):
         else:
             seq = points + list(reversed(points))
 
+        self._maybe_prompt_auto_tare()
         self.multi_pressure_running = True
         threading.Thread(
             target=self.multi_pressure_test_loop,
@@ -1252,7 +1256,7 @@ class App(ttk.Frame):
                   pixel_sense, pixel_timeout, loop_count),
             daemon=True
         ).start()
-        self.log(f"开始多压力测试: {seq}  循环次数={loop_count}  判稳={stable_time}s")
+        self.log(f"启动多压力测试: {seq}  循环次数={loop_count}  判稳={stable_time}s")
 
     def multi_pressure_test_loop(
             self,
@@ -1719,7 +1723,7 @@ class App(ttk.Frame):
 
 4. 压力与保护
    - 大字显示当前压力；触发保护压力后红黄闪烁报警。
-   - “开始压力控制”后：高速靠近 → 低速微调 → 容差内保持。
+   - “启动压力控制”后：高速靠近 → 低速微调 → 容差内保持。
 
 5. 自动多压力测试
    - 填写压力点（逗号分隔）与循环模式，可选像素检测与模拟点击。
@@ -1925,6 +1929,37 @@ class App(ttk.Frame):
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    def _maybe_prompt_auto_tare(self):
+        if self._auto_tare_prompted:
+            return
+
+        self._auto_tare_prompted = True
+
+        import threading
+
+        def _ask_and_handle():
+            answer = messagebox.askyesno("自动去皮", "是否自动去皮？")
+            if answer:
+                self.after(0, self.start_auto_tare)
+            if event:
+                event.set()
+
+        event = None
+        if threading.current_thread() is threading.main_thread():
+            _ask_and_handle()
+        else:
+            event = threading.Event()
+
+            def _wrapped():
+                try:
+                    _ask_and_handle()
+                finally:
+                    if event and not event.is_set():
+                        event.set()
+
+            self.after(0, _wrapped)
+            event.wait()
+
     def set_parameters(self):
         if not self.modbus2:
             return
@@ -1964,6 +1999,7 @@ class App(ttk.Frame):
         if not self.modbus2:
             return
 
+        self._maybe_prompt_auto_tare()
         direction = self.direction.get()
         speed = float(self.speed_entry.get())
         if direction == "下" and speed > 0.5:
@@ -1981,6 +2017,8 @@ class App(ttk.Frame):
     def return_zero(self):
         if not self.modbus2:
             return
+
+        self._maybe_prompt_auto_tare()
         self.log("发送回零命令")
         try:
             resp2 = self.modbus2.write_registers(170, [3, 0], delay=0.005)
@@ -1999,6 +2037,7 @@ class App(ttk.Frame):
             messagebox.showerror("错误", "目标位置必须为数字")
             return
 
+        self._maybe_prompt_auto_tare()
         target_val = int(target * 1000)
         self.log(f"运动到目标位置: {target_val}")
         try:
@@ -2644,6 +2683,7 @@ class App(ttk.Frame):
 
         mode = (self.jump_mode_var.get() or "").strip()
         target_fn = self._jump_by_position_loop if mode == "按实际位置" else self._jump_by_pressure_loop
+        self._maybe_prompt_auto_tare()
         try:
             t = threading.Thread(target=target_fn, args=(enabled_ids,), daemon=True)
             self.jump_running = True
@@ -3416,8 +3456,9 @@ class App(ttk.Frame):
                                            f"您即将以 {self.high_speed} mm/s 的速度下压，这可能导致设备损坏！\n是否继续？"):
                     return False
 
+        self._maybe_prompt_auto_tare()
         self.pressure_control_running = True
-        self.log(f"开始压力控制: 目标压力={self.target_pressure}g, 容差={self.pressure_tolerance}g")
+        self.log(f"启动压力控制: 目标压力={self.target_pressure}g, 容差={self.pressure_tolerance}g")
         self.pressure_control_thread = threading.Thread(target=self.pressure_control_loop, daemon=True)
         self.pressure_control_thread.start()
         self._refresh_pressure_button_states()
@@ -3747,6 +3788,7 @@ class App(ttk.Frame):
         if time.time() < getattr(self, "_no_autostart_until", 0):
             self.log("抑制自动重启（刚刚停止）")
             return
+        self._maybe_prompt_auto_tare()
         try:
             resp2 = self.modbus2.write_registers(178, [1, 0], delay=0.005)
             self.log(f"运动控制器启动命令(quiet): {resp2.hex() if resp2 else ''}")
