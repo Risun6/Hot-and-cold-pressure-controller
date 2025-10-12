@@ -635,27 +635,28 @@ class MultiSequenceApp(ttk.Frame):
         charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
 
-        self._chart_fig = Figure(figsize=(9, 5), dpi=100)
-        grid = self._chart_fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.32)
+
+        self._chart_fig = Figure(figsize=(10, 4.5), dpi=100)
+        grid = self._chart_fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.28)
         ax_temp = self._chart_fig.add_subplot(grid[0, 0])
-        ax_press = self._chart_fig.add_subplot(grid[1, 0], sharex=ax_temp)
+        ax_press = self._chart_fig.add_subplot(grid[0, 1])
 
         ax_temp.set_title("温度实时曲线")
         ax_temp.set_ylabel("温度 (°C)")
+        ax_temp.set_xlabel("时间 (s)")
         self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="当前温度")
         self._temp_line_target, = ax_temp.plot(
             [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="目标温度"
         )
         ax_temp.grid(True, alpha=0.3)
         ax_temp.legend(loc="upper right", fontsize=8)
-        ax_temp.tick_params(labelbottom=False)
 
-        ax_press.set_title("压力 / 电流实时曲线")
-        ax_press.set_ylabel("压力 / 电流")
+        ax_press.set_title("压力实时曲线")
+        ax_press.set_ylabel("压力")
         ax_press.set_xlabel("时间 (s)")
-        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="当前值")
+        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="当前压力")
         self._press_line_target, = ax_press.plot(
-            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="目标值"
+            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="目标压力"
         )
         ax_press.grid(True, alpha=0.3)
         ax_press.legend(loc="upper right", fontsize=8)
