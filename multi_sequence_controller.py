@@ -635,6 +635,7 @@ class MultiSequenceApp(ttk.Frame):
         charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
 
+
         self._chart_fig = Figure(figsize=(10, 4.5), dpi=100)
         grid = self._chart_fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.28)
         ax_temp = self._chart_fig.add_subplot(grid[0, 0])
