@@ -3552,22 +3552,48 @@ class App(ttk.Frame):
 
                         if mode == "点动":
                             desired_dir = "下" if diff > 0 else "上"
-                            if adjust_dir != desired_dir:
+                            if adjust_dir != desired_dir or self.params_modified:
                                 self.direction.set(desired_dir)
-                                self.speed_entry.delete(0, tk.END); self.speed_entry.insert(0, str(low_speed))
-                                self.distance_entry.delete(0, tk.END); self.distance_entry.insert(0, str(jog_step))
+                                self.speed_entry.delete(0, tk.END)
+                                self.speed_entry.insert(0, str(low_speed))
+                                self.distance_entry.delete(0, tk.END)
+                                self.distance_entry.insert(0, str(jog_step))
                                 self.set_parameters()
                                 adjust_dir = desired_dir
                                 self.log(f"渐进区 → 设置 {desired_dir} 点动参数：{low_speed} mm/s, {jog_step} mm")
 
                             self.start_machine()
                             self.current_speed_var.set(f"{low_speed:.3f}")
+
+                            effective_speed = max(abs(low_speed), 1e-4)
+                            jog_duration = min(0.6, max(0.02, jog_step / effective_speed + 0.02))
+                            jog_deadline = time.time() + jog_duration
+                            jog_crossed = False
+                            safety_triggered = False
+
+                            while self.pressure_control_running and time.time() < jog_deadline:
+                                time.sleep(0.01)
+                                current_pressure = self.read_pressure()
+                                if current_pressure >= safety_pressure:
+                                    safety_triggered = True
+                                    break
+
+                                diff = target_pressure - current_pressure
+                                if (desired_dir == "下" and diff <= 0) or (desired_dir == "上" and diff >= 0):
+                                    jog_crossed = True
+                                    break
+
                             self.stop_motion()
+
+                            if safety_triggered:
+                                self.log(f"⚠️ 保护压力触发！{current_pressure:.1f} ≥ {safety_pressure:.1f} g")
+                                break
+
                             current_pressure = self.read_pressure()
                             diff = target_pressure - current_pressure
                             abs_diff = abs(diff)
-                            crossed = (diff > 0 and adjust_dir == "上") or (diff < 0 and adjust_dir == "下")
-                            if crossed:
+
+                            if jog_crossed or (diff > 0 and adjust_dir == "上") or (diff < 0 and adjust_dir == "下"):
                                 self.log("已越过目标压力，切换方向精调")
                                 adjust_dir = None
                             continue
@@ -3608,9 +3634,10 @@ class App(ttk.Frame):
         if not start_btn or not stop_btn:
             return
 
-        if self.sensor_connected and self.controller_connected:
+        connected = self.sensor_connected and self.controller_connected
+        if connected:
             start_btn.config(state="normal" if not self.pressure_control_running else "disabled")
-            stop_btn.config(state="normal" if self.pressure_control_running else "disabled")
+            stop_btn.config(state="normal")
         else:
             start_btn.config(state="disabled")
             stop_btn.config(state="disabled")
