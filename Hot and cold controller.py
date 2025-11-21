@@ -1347,8 +1347,8 @@ class App:
             .pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(rowD, text="V").pack(side=tk.LEFT, padx=(4, 0))
 
-        # === 自动多压力测试（像素监测 + 模拟点击） ===
-        auto_testf = ttk.Labelframe(left, text="自动多压力测试", padding=10)
+        # === 自动多温度测试（像素监测 + 模拟点击） ===
+        auto_testf = ttk.Labelframe(left, text="自动多温度测试", padding=10)
         auto_testf.pack(fill=tk.X, pady=8)
 
         auto_row0 = ttk.Frame(auto_testf)
