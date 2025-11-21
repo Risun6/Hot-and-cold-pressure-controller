@@ -540,6 +540,8 @@ class MultiSequenceApp(ttk.Frame):
         self.press_error_var = tk.StringVar(value="--")
         self.realtime_timestamp_var = tk.StringVar(value="--")
         self.realtime_status_var = tk.StringVar(value="")
+        self.temp_conn_status = tk.StringVar(value="未检查")
+        self.press_conn_status = tk.StringVar(value="未检查")
 
         self.csv_dir = tk.StringVar(value=str(get_logs_dir()))
         self._csv_lock = threading.Lock()
@@ -581,6 +583,7 @@ class MultiSequenceApp(ttk.Frame):
         self._refresh_charts()
         self._init_default_matrix()
         self._start_realtime_monitor()
+        self.refresh_controller_status()
 
     # UI -----------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -683,6 +686,17 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(rt_row3, text="最近更新时间：").pack(side=tk.LEFT, padx=4)
         ttk.Label(rt_row3, textvariable=self.realtime_timestamp_var, width=18).pack(side=tk.LEFT)
         ttk.Label(rt_row3, textvariable=self.realtime_status_var, bootstyle=WARNING).pack(side=tk.LEFT, padx=8)
+
+        rt_row4 = ttk.Frame(realtime_frame)
+        rt_row4.pack(fill=tk.X, pady=2)
+        ttk.Label(rt_row4, text="连接状态：").pack(side=tk.LEFT, padx=4)
+        self.temp_conn_label = ttk.Label(rt_row4, textvariable=self.temp_conn_status, bootstyle=SECONDARY)
+        self.temp_conn_label.pack(side=tk.LEFT, padx=6)
+        self.press_conn_label = ttk.Label(rt_row4, textvariable=self.press_conn_status, bootstyle=SECONDARY)
+        self.press_conn_label.pack(side=tk.LEFT, padx=6)
+        ttk.Button(rt_row4, text="刷新连接", command=self.refresh_controller_status, bootstyle="outline-secondary").pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
 
         charts_frame = ttk.Labelframe(main, text="Live Charts (Last 5 Minutes)")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
@@ -880,6 +894,22 @@ class MultiSequenceApp(ttk.Frame):
             "cooldown_ms": cooldown,
         }
         return plan
+
+    def _preflight_check_controllers(self) -> Tuple[bool, str]:
+        temp_ok, temp_msg = self._ping_controller(
+            "温控", TEMP_DEFAULT_HOST, TEMP_DEFAULT_PORT, handler=self._temp_handler, lock=self._temp_handler_lock
+        )
+        press_ok, press_msg = self._ping_controller(
+            "压力", PRESS_DEFAULT_HOST, PRESS_DEFAULT_PORT, handler=self._press_handler, lock=self._press_handler_lock
+        )
+        if temp_ok and press_ok:
+            return True, ""
+        reasons = []
+        if not temp_ok:
+            reasons.append(f"温控连接失败：{temp_msg}")
+        if not press_ok:
+            reasons.append(f"压力连接失败：{press_msg}")
+        return False, "；".join(reasons)
 
     def _collect_numbers(self, vars_list: List[tk.StringVar], name: str) -> List[float]:
         values: List[float] = []
@@ -1099,6 +1129,10 @@ class MultiSequenceApp(ttk.Frame):
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc))
             return
+        ok, reason = self._preflight_check_controllers()
+        if not ok:
+            messagebox.showerror("连接失败", reason)
+            return
         if not self._open_csv_session():
             return
         self.results.clear()
@@ -1195,6 +1229,25 @@ class MultiSequenceApp(ttk.Frame):
         self._rt_thread.start()
         self.after(500, self._update_realtime_ui)
 
+    def refresh_controller_status(self) -> None:
+        threading.Thread(target=self._refresh_controller_status_worker, daemon=True).start()
+
+    def _refresh_controller_status_worker(self) -> None:
+        temp_ok, temp_msg = self._ping_controller(
+            "温控", TEMP_DEFAULT_HOST, TEMP_DEFAULT_PORT, handler=self._temp_handler, lock=self._temp_handler_lock
+        )
+        press_ok, press_msg = self._ping_controller(
+            "压力", PRESS_DEFAULT_HOST, PRESS_DEFAULT_PORT, handler=self._press_handler, lock=self._press_handler_lock
+        )
+
+        def update_labels() -> None:
+            self.temp_conn_status.set("温控正常" if temp_ok else f"温控异常：{temp_msg}")
+            self.press_conn_status.set("压力正常" if press_ok else f"压力异常：{press_msg}")
+            self.temp_conn_label.configure(bootstyle=SUCCESS if temp_ok else DANGER)
+            self.press_conn_label.configure(bootstyle=SUCCESS if press_ok else DANGER)
+
+        self.after(0, update_labels)
+
     def _fetch_status(
         self,
         host: str,
@@ -1210,6 +1263,22 @@ class MultiSequenceApp(ttk.Frame):
             return resp.get("status")
         except Exception as exc:
             return {"__error__": str(exc)}
+
+    def _ping_controller(
+        self,
+        name: str,
+        host: str,
+        port: int,
+        *,
+        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        lock: Optional[threading.RLock] = None,
+    ) -> Tuple[bool, str]:
+        try:
+            client = ControllerClient(host, port, name, handler=handler, lock=lock)
+            client.ping()
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
 
     def _update_realtime_ui(self) -> None:
         if self._rt_stop.is_set():
