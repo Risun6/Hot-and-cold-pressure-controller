@@ -31,6 +31,8 @@ DEFAULT_TEMP_HOLD = 60.0
 DEFAULT_TEMP_RECHECK_HOLD = 15.0
 DEFAULT_PRESS_MAE = 50.0
 DEFAULT_PRESS_HOLD = 30.0
+DEFAULT_PRESS_STABLE_WINDOW = 15.0
+DEFAULT_PRESS_FLUCT_RANGE = 50.0
 DEFAULT_CELL_TIMEOUT = 300.0
 DEFAULT_CONFIRM_COUNT = 2
 REALTIME_REFRESH_S = 1.0
@@ -333,6 +335,56 @@ class SequenceRunner(threading.Thread):
             return False
         return True
 
+    def wait_pressure_stable_after_temp(
+        self,
+        client: ControllerClient,
+        window_s: float,
+        fluct_threshold: float,
+        *,
+        timeout: Optional[float],
+    ) -> Tuple[Optional[Dict], bool]:
+        start_time = time.time()
+        window_s = max(1.0, float(window_s))
+        fluct_threshold = max(0.0, float(fluct_threshold))
+        samples: Deque[Tuple[float, float]] = deque()
+        last_report = start_time
+        self.log(
+            f"温度切换后，监测压力在 {window_s:.1f}s 内波动不超过 {fluct_threshold:.3f} 以开始测试"
+        )
+        while not self.stop_event.is_set():
+            try:
+                resp = client.status()
+            except Exception as exc:
+                self.log(f"温度切换后压力监测失败: {exc}")
+                time.sleep(1.0)
+                continue
+            status = resp.get("status", {})
+            pressure_val = self._safe_float(self.app._extract_pressure_value(status))
+            now = time.time()
+            if pressure_val is not None:
+                samples.append((now, pressure_val))
+                cutoff = now - window_s
+                while samples and samples[0][0] < cutoff:
+                    samples.popleft()
+                if samples and samples[-1][0] - samples[0][0] >= window_s * 0.95:
+                    values = [val for _, val in samples]
+                    fluct = max(values) - min(values)
+                    if fluct <= fluct_threshold:
+                        self.log(
+                            f"压力波动 {fluct:.3f} 满足阈值，开始当前温度的压力列表"
+                        )
+                        return status, False
+                    if now - last_report >= 5.0:
+                        self.log(
+                            f"当前压力波动 {fluct:.3f} 超过阈值 {fluct_threshold:.3f}，继续等待"
+                        )
+                        last_report = now
+            if timeout is not None and now - start_time >= timeout:
+                self.log("温度切换后的压力判稳超时")
+                return None, True
+            time.sleep(1.0)
+        return None, False
+
     def _record_result(
         self,
         row: int,
@@ -414,6 +466,8 @@ class SequenceRunner(threading.Thread):
         p_hold = self.plan.get("press_hold", DEFAULT_PRESS_HOLD)
         confirm_need = int(self.plan.get("repeat_confirm", DEFAULT_CONFIRM_COUNT))
         recheck_hold = float(self.plan.get("temp_recheck_hold", DEFAULT_TEMP_RECHECK_HOLD))
+        press_window = float(self.plan.get("press_settle_window", DEFAULT_PRESS_STABLE_WINDOW))
+        press_fluct = float(self.plan.get("press_settle_range", DEFAULT_PRESS_FLUCT_RANGE))
 
         try:
             for col, temp_target in enumerate(temps):
@@ -434,6 +488,17 @@ class SequenceRunner(threading.Thread):
                 if temp_status is None:
                     if temp_timeout:
                         self.app.mark_column_timeout(col, "温度超时")
+                        continue
+                    break
+                settle_status, settle_timeout = self.wait_pressure_stable_after_temp(
+                    pressure_client,
+                    press_window,
+                    press_fluct,
+                    timeout=timeout,
+                )
+                if settle_status is None:
+                    if settle_timeout:
+                        self.app.mark_column_timeout(col, "温度后压力不稳")
                         continue
                     break
                 for row, current_target in enumerate(currents):
@@ -519,6 +584,7 @@ class MultiSequenceApp(ttk.Frame):
         if hasattr(self._window, "protocol"):
             self._window.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self._pressure_controller = pressure_controller
         self._temp_handler = getattr(temp_controller, "_handle_tcp_command", None)
         self._press_handler = getattr(pressure_controller, "_handle_tcp_command", None)
         self._temp_handler_lock = threading.RLock() if self._temp_handler else None
@@ -531,6 +597,10 @@ class MultiSequenceApp(ttk.Frame):
 
         self.cell_timeout_var = tk.DoubleVar(value=DEFAULT_CELL_TIMEOUT)
         self.confirm_count_var = tk.IntVar(value=DEFAULT_CONFIRM_COUNT)
+        self.press_settle_window_var = tk.DoubleVar(value=DEFAULT_PRESS_STABLE_WINDOW)
+        self.press_settle_range_var = tk.DoubleVar(
+            value=self._get_pressure_tolerance(DEFAULT_PRESS_FLUCT_RANGE)
+        )
 
         self.temp_live_var = tk.StringVar(value="--")
         self.temp_target_var = tk.StringVar(value="--")
@@ -587,8 +657,25 @@ class MultiSequenceApp(ttk.Frame):
 
     # UI -----------------------------------------------------------------
     def _build_ui(self) -> None:
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main = ttk.Frame(canvas, padding=12)
+        window_id = canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _sync_scroll_region(event: tk.Event) -> None:  # type: ignore[type-arg]
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        main.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+        self._bind_mousewheel(canvas)
 
         matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：电流）")
         matrix_frame.pack(fill=tk.X, pady=8)
@@ -633,6 +720,22 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(opt_row, text="说明：采用固定判稳阈值自动复检，超时将标记为红色并跳过。", bootstyle=INFO).pack(
             side=tk.LEFT, padx=8
         )
+
+        press_precheck_row = ttk.Frame(options_frame)
+        press_precheck_row.pack(fill=tk.X, pady=4)
+        ttk.Label(press_precheck_row, text="温度切换后压力稳定时间 (s)").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(press_precheck_row, textvariable=self.press_settle_window_var, width=8).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Label(press_precheck_row, text="压力波动阈值").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(press_precheck_row, textvariable=self.press_settle_range_var, width=10).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Label(
+            press_precheck_row,
+            text="温度变化后，只有在设定时间内压力波动低于阈值才开始压力列表。",
+            bootstyle=INFO,
+        ).pack(side=tk.LEFT, padx=8)
 
         record_frame = ttk.Labelframe(main, text="数据记录（CSV 导出）")
         record_frame.pack(fill=tk.X, pady=8)
@@ -856,6 +959,15 @@ class MultiSequenceApp(ttk.Frame):
             raise ValueError("请至少输入一个电流目标")
         timeout = max(5.0, float(self.cell_timeout_var.get()))
         confirm_need = max(1, int(self.confirm_count_var.get()))
+        try:
+            press_window = max(1.0, float(self.press_settle_window_var.get()))
+        except Exception:
+            press_window = DEFAULT_PRESS_STABLE_WINDOW
+        try:
+            press_fluct_range = max(0.0, float(self.press_settle_range_var.get()))
+        except Exception:
+            press_fluct_range = self._get_pressure_tolerance(DEFAULT_PRESS_FLUCT_RANGE)
+        press_mae = self._get_pressure_tolerance(DEFAULT_PRESS_MAE)
         plan = {
             "temp_host": TEMP_DEFAULT_HOST,
             "temp_port": TEMP_DEFAULT_PORT,
@@ -867,9 +979,11 @@ class MultiSequenceApp(ttk.Frame):
             "temp_mae": DEFAULT_TEMP_MAE,
             "temp_hold": DEFAULT_TEMP_HOLD,
             "temp_recheck_hold": DEFAULT_TEMP_RECHECK_HOLD,
-            "press_mae": DEFAULT_PRESS_MAE,
+            "press_mae": press_mae,
             "press_hold": DEFAULT_PRESS_HOLD,
             "repeat_confirm": confirm_need,
+            "press_settle_window": press_window,
+            "press_settle_range": press_fluct_range,
         }
         try:
             delay_ms = max(0, int(self.sim_click_delay_var.get()))
@@ -923,6 +1037,34 @@ class MultiSequenceApp(ttk.Frame):
                 raise ValueError(f"{name}第 {idx} 项格式错误：{text}") from None
         return values
 
+    def _get_pressure_tolerance(self, fallback: float) -> float:
+        controller = getattr(self, "_pressure_controller", None)
+        if controller is None:
+            return float(fallback)
+        candidates = []
+        try:
+            tol_attr = getattr(controller, "pressure_tolerance", None)
+            if tol_attr is not None:
+                candidates.append(tol_attr)
+        except Exception:
+            pass
+        try:
+            tol_var = getattr(controller, "tolerance_var", None)
+            if tol_var is not None:
+                candidates.append(tol_var)
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                if isinstance(candidate, tk.Variable):
+                    value = candidate.get()
+                else:
+                    value = candidate
+                return float(value)
+            except Exception:
+                continue
+        return float(fallback)
+
     def set_sim_click_point(self) -> None:
         pos = capture_click_point(
             self,
@@ -948,6 +1090,22 @@ class MultiSequenceApp(ttk.Frame):
                 return
             self.csv_dir.set(str(path))
             self.log(f"CSV 保存目录已设置为 {path}")
+
+    def _bind_mousewheel(self, widget: tk.Widget) -> None:
+        def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                delta = -1 * int(event.delta / 120)
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                widget.yview_scroll(delta, "units")
+
+        widget.bind_all("<MouseWheel>", _on_mousewheel, add=True)
+        widget.bind_all("<Button-4>", _on_mousewheel, add=True)
+        widget.bind_all("<Button-5>", _on_mousewheel, add=True)
 
     @staticmethod
     def _format_csv_number(value: Optional[float]) -> str:
