@@ -21,6 +21,7 @@ import serial.tools.list_ports
 
 from tcp_utils import JSONLineServer
 from sim_click import perform_click_async
+from PIL import Image, ImageChops
 
 # ---- 可选依赖：鼠标/键盘 ----
 try:
@@ -893,6 +894,18 @@ class App:
         self.auto_click_double = tk.BooleanVar(value=False)
         self.auto_click_delay_ms = tk.StringVar(value="0")  # ← StringVar
 
+        # —— 自动测试：像素检测 + 模拟点击 ——
+        self.detection_interval_var = tk.IntVar(value=1000)  # ms
+        self.pixel_detection_enabled = tk.BooleanVar(value=False)
+        self.pixel_detection_region = None
+        self.pixel_sensitivity_var = tk.DoubleVar(value=5.0)
+        self.pixel_timeout_var = tk.DoubleVar(value=120.0)
+        self.pixel_log_enabled = tk.BooleanVar(value=False)
+        self.pixel_click_cooldown_var = tk.IntVar(value=2000)
+        self._last_pixel_click_ts = 0.0
+        self.initial_pixel_snapshot = None
+        self.prev_pixel_snapshot = None
+
         # —— 坐标拾取运行态 ——
         self._pick_running = False
         self.pick_preview = tk.StringVar(value="X=—, Y=—")  # 实时预览
@@ -1334,39 +1347,61 @@ class App:
             .pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(rowD, text="V").pack(side=tk.LEFT, padx=(4, 0))
 
-        # === 模拟点击（开始线性时触发） ===
-        clickf = ttk.Labelframe(left, text="模拟点击（开始线性时）", padding=10)
-        clickf.pack(fill=tk.X, pady=8)
+        # === 自动多压力测试（像素监测 + 模拟点击） ===
+        auto_testf = ttk.Labelframe(left, text="自动多压力测试", padding=10)
+        auto_testf.pack(fill=tk.X, pady=8)
 
-        r0 = ttk.Frame(clickf);
-        r0.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(r0, text="启用", variable=self.auto_click_enable).pack(side=tk.LEFT)
-        ttk.Label(r0, text="延迟(ms)").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(r0, textvariable=self.auto_click_delay_ms, width=8).pack(side=tk.LEFT)
+        auto_row0 = ttk.Frame(auto_testf)
+        auto_row0.pack(fill=tk.X, pady=2)
+        ttk.Label(auto_row0, text="像素检测间隔(ms)").pack(side=tk.LEFT)
+        ttk.Entry(auto_row0, textvariable=self.detection_interval_var, width=10).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(auto_row0, text="点击冷却(ms)").pack(side=tk.LEFT)
+        ttk.Entry(auto_row0, textvariable=self.pixel_click_cooldown_var, width=10).pack(side=tk.LEFT, padx=(4, 0))
 
-        r1 = ttk.Frame(clickf);
-        r1.pack(fill=tk.X, pady=2)
-        ttk.Label(r1, text="屏幕X").pack(side=tk.LEFT)
-        self.ent_auto_x = ttk.Entry(r1, textvariable=self.auto_click_x, width=8)
+        auto_row1 = ttk.Frame(auto_testf)
+        auto_row1.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(auto_row1, text="启用像素检测", variable=self.pixel_detection_enabled).pack(side=tk.LEFT)
+        ttk.Button(auto_row1, text="设置检测区域", command=self.set_pixel_detection_region,
+                   bootstyle="outline-info").pack(side=tk.LEFT, padx=(8, 6))
+        self.indicator_canvas = tk.Canvas(auto_row1, width=18, height=18, highlightthickness=0)
+        self.indicator_circle = self.indicator_canvas.create_oval(2, 2, 16, 16, fill="red")
+        self.indicator_canvas.pack(side=tk.LEFT, padx=6)
+
+        auto_row2 = ttk.Frame(auto_testf)
+        auto_row2.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(auto_row2, text="记录检测日志", variable=self.pixel_log_enabled).pack(side=tk.LEFT)
+        ttk.Label(auto_row2, text="灵敏度(%)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(auto_row2, textvariable=self.pixel_sensitivity_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(auto_row2, text="超时(s)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(auto_row2, textvariable=self.pixel_timeout_var, width=8).pack(side=tk.LEFT)
+
+        auto_row3 = ttk.Frame(auto_testf)
+        auto_row3.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(auto_row3, text="启用模拟点击", variable=self.auto_click_enable).pack(side=tk.LEFT)
+        ttk.Label(auto_row3, text="延迟(ms)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(auto_row3, textvariable=self.auto_click_delay_ms, width=8).pack(side=tk.LEFT)
+        ttk.Label(auto_row3, text="按键").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Combobox(auto_row3, textvariable=self.auto_click_button, width=8,
+                     values=["left", "right", "middle"]).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Checkbutton(auto_row3, text="双击", variable=self.auto_click_double).pack(side=tk.LEFT)
+
+        auto_row4 = ttk.Frame(auto_testf)
+        auto_row4.pack(fill=tk.X, pady=2)
+        ttk.Label(auto_row4, text="屏幕X").pack(side=tk.LEFT)
+        self.ent_auto_x = ttk.Entry(auto_row4, textvariable=self.auto_click_x, width=8)
         self.ent_auto_x.pack(side=tk.LEFT, padx=(4, 12))
-
-        ttk.Label(r1, text="屏幕Y").pack(side=tk.LEFT)
-        self.ent_auto_y = ttk.Entry(r1, textvariable=self.auto_click_y, width=8)
+        ttk.Label(auto_row4, text="屏幕Y").pack(side=tk.LEFT)
+        self.ent_auto_y = ttk.Entry(auto_row4, textvariable=self.auto_click_y, width=8)
         self.ent_auto_y.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(auto_row4, textvariable=self.pick_preview, width=18).pack(side=tk.LEFT, padx=(8, 6))
 
-        ttk.Label(r1, text="按键").pack(side=tk.LEFT)
-        ttk.Combobox(r1, textvariable=self.auto_click_button, width=8,
-                     values=["left", "right", "middle"]).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Checkbutton(r1, text="双击", variable=self.auto_click_double).pack(side=tk.LEFT)
-
-        # —— 坐标拾取 ——
-        r2 = ttk.Frame(clickf);
-        r2.pack(fill=tk.X, pady=2)
-        ttk.Label(r2, textvariable=self.pick_preview, width=18).pack(side=tk.LEFT)
-        ttk.Button(r2, text="按 Enter 取点", command=self._start_pick_coord_enter).pack(side=tk.LEFT, padx=(6, 6))
-        ttk.Button(r2, text="停止拾取", command=self._stop_pick_coord).pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Button(clickf, text="立即测试点击",
+        auto_row5 = ttk.Frame(auto_testf)
+        auto_row5.pack(fill=tk.X, pady=2)
+        ttk.Button(auto_row5, text="按 Enter 取点", command=self._start_pick_coord_enter,
+                   bootstyle="outline-primary").pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Button(auto_row5, text="停止拾取", command=self._stop_pick_coord,
+                   bootstyle="outline-secondary").pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(auto_row5, text="立即测试点击",
                    command=lambda: self._simulate_click(
                        int(self.auto_click_x.get() or 0),
                        int(self.auto_click_y.get() or 0),
@@ -1374,7 +1409,7 @@ class App:
                        bool(self.auto_click_double.get()),
                        int(self.auto_click_delay_ms.get() or 0)
                    ),
-                   bootstyle=SECONDARY).pack(anchor="e", pady=(6, 0))
+                   bootstyle=SECONDARY).pack(side=tk.LEFT)
 
         # 数据记录
         rec = ttk.Labelframe(left, text="数据记录（CSV 导出）", padding=10);
@@ -3568,6 +3603,14 @@ class App:
             "auto_click_double": bool(self.auto_click_double.get()),
             "auto_click_delay_ms": s2i(self.auto_click_delay_ms, 0),
 
+            "pixel_detection_enabled": bool(self.pixel_detection_enabled.get()),
+            "pixel_detection_region": list(self.pixel_detection_region) if self.pixel_detection_region else None,
+            "pixel_sensitivity": self.pixel_sensitivity_var.get(),
+            "pixel_timeout": self.pixel_timeout_var.get(),
+            "pixel_log_enabled": bool(self.pixel_log_enabled.get()),
+            "pixel_click_cooldown": s2i(self.pixel_click_cooldown_var, 2000),
+            "detection_interval": s2i(self.detection_interval_var, 1000),
+
             # === 新增：循环泵持久化 ===
             "pump_port": sval(self.pump_port),
             "pump_baud": s2i(self.pump_baud, PUMP_BAUD),
@@ -3660,6 +3703,16 @@ class App:
             self.auto_click_double.set(cfg.get("auto_click_double", self.auto_click_double.get()))
             self.auto_click_delay_ms.set(
                 str(cfg.get("auto_click_delay_ms", int(self.auto_click_delay_ms.get() or "0"))))
+
+            self.pixel_detection_enabled.set(cfg.get("pixel_detection_enabled", self.pixel_detection_enabled.get()))
+            region = cfg.get("pixel_detection_region")
+            if isinstance(region, (list, tuple)) and len(region) == 4:
+                self.pixel_detection_region = tuple(int(v) for v in region)
+            self.pixel_sensitivity_var.set(cfg.get("pixel_sensitivity", self.pixel_sensitivity_var.get()))
+            self.pixel_timeout_var.set(cfg.get("pixel_timeout", self.pixel_timeout_var.get()))
+            self.pixel_log_enabled.set(cfg.get("pixel_log_enabled", self.pixel_log_enabled.get()))
+            self.pixel_click_cooldown_var.set(_get_int("pixel_click_cooldown", self.pixel_click_cooldown_var.get()))
+            self.detection_interval_var.set(_get_int("detection_interval", self.detection_interval_var.get()))
 
             # —— PWM 相关 ——
             self.pump_pwm_enable.set(cfg.get("pump_pwm_enable", self.pump_pwm_enable.get()))
@@ -3920,6 +3973,138 @@ class App:
         self.pick_preview.set(f"X={int(x)}, Y={int(y)}")
         self._set_status(f"已记录坐标：({int(x)},{int(y)})，已启用自动点击")
 
+    def set_indicator_color(self, color: str):
+        try:
+            if hasattr(self, "indicator_canvas"):
+                self.indicator_canvas.itemconfig(self.indicator_circle, fill=color)
+                if color == "green":
+                    self.root.after(600, lambda: self.set_indicator_color("red"))
+        except Exception:
+            pass
+
+    def _capture_pixel_baseline(self) -> bool:
+        if pyautogui is None or not self.pixel_detection_region:
+            return False
+        try:
+            snap = pyautogui.screenshot(region=self.pixel_detection_region)
+            if snap.mode != "RGB":
+                snap = snap.convert("RGB")
+            self.initial_pixel_snapshot = snap
+            self.prev_pixel_snapshot = None
+            return True
+        except Exception as exc:
+            self._set_status(f"基线截图失败：{exc}")
+            return False
+
+    def set_pixel_detection_region(self):
+        messagebox.showinfo("设置检测区域", "请用鼠标框选需要检测的屏幕区域，按 Enter 键确认。")
+        overlay = tk.Toplevel(self.root)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-alpha", 0.3)
+        overlay.attributes("-topmost", True)
+        overlay.configure(background="gray")
+        overlay.grab_set()
+        overlay.focus_force()
+
+        canvas = tk.Canvas(overlay, cursor="cross", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.focus_set()
+
+        coords = {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0, 'rect': None}
+
+        def on_press(event):
+            coords['x1'], coords['y1'] = event.x, event.y
+            if coords['rect']:
+                canvas.delete(coords['rect'])
+            coords['rect'] = canvas.create_rectangle(coords['x1'], coords['y1'], event.x, event.y, outline="red", width=2)
+
+        def on_drag(event):
+            canvas.coords(coords['rect'], coords['x1'], coords['y1'], event.x, event.y)
+
+        def on_release(event):
+            coords['x2'], coords['y2'] = event.x, event.y
+
+        def on_enter(event=None):
+            overlay.grab_release()
+            x1, y1 = coords['x1'], coords['y1']
+            x2, y2 = coords['x2'], coords['y2']
+            left, right = sorted((x1, x2))
+            top, bottom = sorted((y1, y2))
+            width = max(0, right - left)
+            height = max(0, bottom - top)
+            abs_x = overlay.winfo_rootx() + left
+            abs_y = overlay.winfo_rooty() + top
+
+            try:
+                if width <= 0 or height <= 0:
+                    raise ValueError('selected area too small')
+
+                try:
+                    screen_w, screen_h = pyautogui.size() if pyautogui else (None, None)
+                except Exception:
+                    screen_w = screen_h = None
+
+                if screen_w is not None and screen_h is not None:
+                    abs_x = max(0, min(abs_x, screen_w - 1))
+                    abs_y = max(0, min(abs_y, screen_h - 1))
+                    width = min(width, max(0, screen_w - abs_x))
+                    height = min(height, max(0, screen_h - abs_y))
+                    if width <= 0 or height <= 0:
+                        raise ValueError('selected area too small')
+
+                region = (int(abs_x), int(abs_y), int(width), int(height))
+                self.pixel_detection_region = region
+                if self._capture_pixel_baseline():
+                    self._set_status(f"已设置检测区域：{region}")
+                else:
+                    self._set_status(f"已设置区域：{region}（未能截取基线）")
+            finally:
+                overlay.destroy()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<Return>", on_enter)
+        canvas.bind("<Escape>", lambda e=None: overlay.destroy())
+        overlay.bind("<Return>", on_enter)
+        overlay.bind("<Escape>", lambda e=None: overlay.destroy())
+
+    def check_pixel_change(self):
+        if not self.pixel_detection_region:
+            return False, "未设置检测区域"
+        if pyautogui is None:
+            return False, "未安装 pyautogui，无法截屏"
+        try:
+            curr = pyautogui.screenshot(region=self.pixel_detection_region)
+            if curr.mode != "RGB":
+                curr = curr.convert("RGB")
+            base = self.prev_pixel_snapshot or self.initial_pixel_snapshot
+            if base is None:
+                base = curr
+            diff = ImageChops.difference(base, curr)
+            self.prev_pixel_snapshot = curr
+            diff_data = diff.getdata()
+            diff_pixels = sum(1 for px in diff_data if px != (0, 0, 0))
+            total = curr.width * curr.height
+            pct = diff_pixels / total * 100 if total else 0
+            if pct >= float(self.pixel_sensitivity_var.get()):
+                return True, f"检测到像素变化: {pct:.2f}%"
+            return False, f"无显著变化: {pct:.2f}%"
+        except Exception as exc:
+            return False, f"检测失败: {exc}"
+
+    def wait_for_pixel_change(self, timeout: float, interval: float):
+        start = time.time()
+        while time.time() - start <= timeout:
+            changed, msg = self.check_pixel_change()
+            if self.pixel_log_enabled.get():
+                self._set_status(msg)
+            if changed:
+                self.set_indicator_color("green")
+                return True, msg
+            time.sleep(max(0.05, interval))
+        return False, "像素检测超时"
+
     def _simulate_click(self, x: int, y: int, button: str = "left", double: bool = False, delay_ms: int = 0):
         """非阻塞模拟点击：后台线程执行点击；UI 更新回主线程。"""
         # 最终再做一次坐标保护
@@ -3972,7 +4157,38 @@ class App:
         except Exception:
             dly = 0
 
+        try:
+            cooldown_ms = max(0, int(self.pixel_click_cooldown_var.get()))
+        except Exception:
+            cooldown_ms = 0
+        now = time.time()
+        if cooldown_ms and now - self._last_pixel_click_ts < cooldown_ms / 1000.0:
+            self._set_status("模拟点击冷却中，跳过本次自动触发。")
+            return
+
         self._simulate_click(x, y, btn or "left", dbl, dly)
+        self._last_pixel_click_ts = time.time()
+
+        if self.pixel_detection_enabled.get():
+            if not self.pixel_detection_region:
+                self._set_status("已启用像素检测，但未设置区域。")
+                return
+            if not self._capture_pixel_baseline():
+                return
+            try:
+                timeout = float(self.pixel_timeout_var.get())
+            except Exception:
+                timeout = 120.0
+            try:
+                interval = max(0.05, float(self.detection_interval_var.get()) / 1000.0)
+            except Exception:
+                interval = 0.5
+            self._set_status("开始像素检测…")
+            detected, msg = self.wait_for_pixel_change(timeout, interval)
+            if detected:
+                self._set_status(f"像素检测通过：{msg}")
+            else:
+                self._set_status(msg)
 
     def _get_cursor_pos(self):
         """返回全局屏幕坐标 (x, y)。优先 pyautogui；否则 Windows 用 ctypes 回退。"""
