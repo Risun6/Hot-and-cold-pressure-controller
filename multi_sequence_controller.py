@@ -1316,8 +1316,10 @@ class MultiSequenceApp(ttk.Frame):
                 self.pixel_detection_region = region
                 if self._capture_pixel_baseline():
                     self.log(f"像素检测区域已设置：{region}")
+                    self.set_indicator_color("green")
                 else:
                     self.log(f"像素区域已设置：{region}（未能截取基线）")
+                    self.set_indicator_color("orange")
             finally:
                 overlay.destroy()
 
