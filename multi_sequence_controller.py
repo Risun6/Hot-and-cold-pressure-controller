@@ -463,6 +463,9 @@ class SequenceRunner(threading.Thread):
             return False, "未设置检测区域"
         if pyautogui is None:
             return False, "未安装 pyautogui，无法截屏"
+        if self.pixel_base is None:
+            if not self._capture_pixel_baseline():
+                return False, "尚未截取基线截图，无法检测"
         try:
             curr = pyautogui.screenshot(region=self.pixel_region)
             if curr.mode != "RGB":
