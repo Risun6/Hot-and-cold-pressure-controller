@@ -4074,6 +4074,10 @@ class App:
             return False, "未设置检测区域"
         if pyautogui is None:
             return False, "未安装 pyautogui，无法截屏"
+        if self.initial_pixel_snapshot is None:
+            # 可能是重新载入配置或上次检测失败后尚未截取基线，这里补一次
+            if not self._capture_pixel_baseline():
+                return False, "尚未截取基线截图，无法检测"
         try:
             curr = pyautogui.screenshot(region=self.pixel_detection_region)
             if curr.mode != "RGB":
@@ -4094,6 +4098,9 @@ class App:
             return False, f"检测失败: {exc}"
 
     def wait_for_pixel_change(self, timeout: float, interval: float):
+        if self.initial_pixel_snapshot is None:
+            if not self._capture_pixel_baseline():
+                return False, "未能截取基线截图"
         start = time.time()
         while time.time() - start <= timeout:
             changed, msg = self.check_pixel_change()
