@@ -614,6 +614,14 @@ class MultiSequenceApp(ttk.Frame):
         self.matrix_grid = ttk.Frame(matrix_frame)
         self.matrix_grid.pack(fill=tk.X, pady=4)
 
+        matrix_actions = ttk.Frame(matrix_frame)
+        matrix_actions.pack(fill=tk.X, pady=4)
+        ttk.Button(matrix_actions, text="开始执行", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT, padx=4)
+        ttk.Button(matrix_actions, text="停止", bootstyle=DANGER, command=self.stop_plan).pack(side=tk.LEFT, padx=4)
+        ttk.Button(matrix_actions, text="导出结果", command=self.export_results, bootstyle="outline-primary").pack(
+            side=tk.RIGHT, padx=4
+        )
+
         options_frame = ttk.Labelframe(main, text="执行设置")
         options_frame.pack(fill=tk.X, pady=8)
         opt_row = ttk.Frame(options_frame)
@@ -729,14 +737,6 @@ class MultiSequenceApp(ttk.Frame):
 
         self.chart_canvas = FigureCanvasTkAgg(self._chart_fig, master=charts_frame)
         self.chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        buttons = ttk.Frame(main)
-        buttons.pack(fill=tk.X, pady=8)
-        ttk.Button(buttons, text="开始执行", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT, padx=4)
-        ttk.Button(buttons, text="停止", bootstyle=DANGER, command=self.stop_plan).pack(side=tk.LEFT, padx=4)
-        ttk.Button(buttons, text="导出结果", command=self.export_results, bootstyle="outline-primary").pack(
-            side=tk.RIGHT, padx=4
-        )
 
         if self._use_internal_log:
             log_frame = ttk.Labelframe(main, text="日志")
