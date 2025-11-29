@@ -1091,6 +1091,7 @@ class App(ttk.Frame):
         self.sim_click_pos_b = None
         self.pressure_points_var = tk.StringVar(value="1000,2000,3000")
         self.loop_mode_var = tk.StringVar(value="顺序")
+        self.loop_count_var = tk.IntVar(value=1)
         self.multi_pressure_running = False
         self.multi_pressure_runner: Optional[threading.Thread] = None
         self.pixel_detection_enabled = tk.BooleanVar(value=False)
@@ -1528,46 +1529,6 @@ class App(ttk.Frame):
         self.stop_pressure_btn = ttk.Button(btn_frame, text="停止压力控制", command=self.stop_pressure_control,
                                             state="disabled", bootstyle="danger")
         self.stop_pressure_btn.pack(side=tk.LEFT, padx=10)
-
-        # ===== 自动多压力测试 =====
-        multi_pressure_frame = ttk.Labelframe(self.scrollable_frame, text="自动多压力测试")
-        multi_pressure_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        points_frame = ttk.Frame(multi_pressure_frame)
-        points_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(points_frame, text="压力点(g):").pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Entry(points_frame, textvariable=self.pressure_points_var, width=25).pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Label(points_frame, text="(用逗号分隔)").pack(side=tk.LEFT, padx=5, pady=2)
-
-        mode_stable_frame = ttk.Frame(multi_pressure_frame)
-        mode_stable_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(mode_stable_frame, text="循环模式:").pack(side=tk.LEFT, padx=5, pady=2)
-        self.loop_mode_combo = ttk.Combobox(mode_stable_frame, textvariable=self.loop_mode_var, width=8)
-        self.loop_mode_combo['values'] = ("顺序", "倒序", "顺序+倒序")
-        self.loop_mode_combo.pack(side=tk.LEFT, padx=(0, 15), pady=2)
-        ttk.Label(mode_stable_frame, text="判稳时长(s):").pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Entry(mode_stable_frame, textvariable=self.stable_time_var, width=4).pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Label(mode_stable_frame, text="循环次数:").pack(side=tk.LEFT, padx=10, pady=2)
-        self.loop_count_var = tk.IntVar(value=1)
-        ttk.Entry(mode_stable_frame, textvariable=self.loop_count_var, width=3).pack(side=tk.LEFT, padx=2, pady=2)
-
-        tcp_frame = ttk.Frame(multi_pressure_frame)
-        tcp_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(tcp_frame, text="TCP主机:").pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Entry(tcp_frame, textvariable=self.multi_tcp_host_var, width=16).pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Label(tcp_frame, text="端口:").pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Entry(tcp_frame, textvariable=self.multi_tcp_port_var, width=8).pack(side=tk.LEFT, padx=5, pady=2)
-        ttk.Button(tcp_frame, text="测试连接", command=self.test_multi_pressure_host, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=10, pady=2)
-
-        time_params_frame = ttk.Frame(multi_pressure_frame)
-        time_params_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(time_params_frame, text="压力步进间隔(s):").grid(row=0, column=0, padx=5, pady=2, sticky='w')
-        ttk.Entry(time_params_frame, textvariable=self.pressure_step_interval_var, width=8).grid(row=0, column=1, padx=2, pady=2)
-
-        button_frame = ttk.Frame(multi_pressure_frame)
-        button_frame.pack(padx=5, pady=5)
-        ttk.Button(button_frame, text="启动多压力测试", command=self.start_multi_pressure_test, bootstyle="success").pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(button_frame, text="停止多压力测试", command=self.stop_multi_pressure_test, bootstyle="danger").pack(side=tk.LEFT)
 
         # —— 开关比测试（OFR） ——
         ofr_frame = ttk.Labelframe(self.scrollable_frame, text="开关比测试（OFR）")
