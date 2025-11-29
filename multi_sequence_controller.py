@@ -15,6 +15,7 @@ from ttkbootstrap.constants import *
 from tkinter import filedialog, messagebox, scrolledtext
 
 import matplotlib
+
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -99,12 +100,12 @@ def get_logs_dir() -> Path:
 
 class ControllerClient:
     def __init__(
-        self,
-        host: str,
-        port: int,
-        name: str,
-        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        lock: Optional[threading.RLock] = None,
+            self,
+            host: str,
+            port: int,
+            name: str,
+            handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            lock: Optional[threading.RLock] = None,
     ):
         self.host = host
         self.port = port
@@ -179,13 +180,13 @@ class ControllerClient:
 
 class SequenceRunner(threading.Thread):
     def __init__(
-        self,
-        app: "MultiSequenceApp",
-        plan: Dict,
-        temp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        press_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        temp_lock: Optional[threading.RLock] = None,
-        press_lock: Optional[threading.RLock] = None,
+            self,
+            app: "MultiSequenceApp",
+            plan: Dict,
+            temp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            press_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            temp_lock: Optional[threading.RLock] = None,
+            press_lock: Optional[threading.RLock] = None,
     ):
         super().__init__(daemon=True)
         self.app = app
@@ -215,14 +216,14 @@ class SequenceRunner(threading.Thread):
             return None
 
     def wait_temperature(
-        self,
-        client: ControllerClient,
-        mae_thr: float,
-        hold_s: float,
-        *,
-        timeout: Optional[float],
-        confirm_need: int,
-        context: str,
+            self,
+            client: ControllerClient,
+            mae_thr: float,
+            hold_s: float,
+            *,
+            timeout: Optional[float],
+            confirm_need: int,
+            context: str,
     ) -> Tuple[Optional[Dict], bool]:
         start_time = time.time()
         stable_since = None
@@ -279,14 +280,14 @@ class SequenceRunner(threading.Thread):
         return None, False
 
     def wait_pressure(
-        self,
-        client: ControllerClient,
-        mae_thr: float,
-        hold_s: float,
-        *,
-        timeout: Optional[float],
-        confirm_need: int,
-        context: str,
+            self,
+            client: ControllerClient,
+            mae_thr: float,
+            hold_s: float,
+            *,
+            timeout: Optional[float],
+            confirm_need: int,
+            context: str,
     ) -> Tuple[Optional[Dict], bool]:
         start_time = time.time()
         stable_since = None
@@ -372,12 +373,12 @@ class SequenceRunner(threading.Thread):
         return True
 
     def wait_pressure_stable_after_temp(
-        self,
-        client: ControllerClient,
-        window_s: float,
-        fluct_threshold: float,
-        *,
-        timeout: Optional[float],
+            self,
+            client: ControllerClient,
+            window_s: float,
+            fluct_threshold: float,
+            *,
+            timeout: Optional[float],
     ) -> Tuple[Optional[Dict], bool]:
         start_time = time.time()
         window_s = max(1.0, float(window_s))
@@ -422,13 +423,13 @@ class SequenceRunner(threading.Thread):
         return None, False
 
     def _record_result(
-        self,
-        row: int,
-        col: int,
-        temperature: float,
-        current: float,
-        temp_status: Dict,
-        pressure_status: Dict,
+            self,
+            row: int,
+            col: int,
+            temperature: float,
+            current: float,
+            temp_status: Dict,
+            pressure_status: Dict,
     ) -> None:
         result = {
             "timestamp": time.time(),
@@ -565,10 +566,10 @@ class SequenceRunner(threading.Thread):
 
 class MultiSequenceApp(ttk.Frame):
     def __init__(
-        self,
-        master: Optional[tk.Misc] = None,
-        temp_controller: Optional[Any] = None,
-        pressure_controller: Optional[Any] = None,
+            self,
+            master: Optional[tk.Misc] = None,
+            temp_controller: Optional[Any] = None,
+            pressure_controller: Optional[Any] = None,
     ) -> None:
         if master is None:
             window = ttk.Window(themename="cosmo")
@@ -589,6 +590,7 @@ class MultiSequenceApp(ttk.Frame):
         if hasattr(self._window, "title"):
             self._window.title("冷热平台多点自动测试")
         if hasattr(self._window, "geometry"):
+            # 略微拉宽窗口，界面更舒展
             self._window.geometry("1100x760")
         if hasattr(self._window, "protocol"):
             self._window.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -629,32 +631,17 @@ class MultiSequenceApp(ttk.Frame):
         self._csv_path: Optional[Path] = None
         self._csv_has_data = False
 
-        def _pc_value(name: str, fallback: Any) -> Any:
-            pc = self._pressure_controller
-            try:
-                var = getattr(pc, name)
-                return var.get()
-            except Exception:
-                return fallback
+        # 自动多序列测试相关变量
+        self.sequence_list = []  # 存储生成的序列
+        self.current_sequence_index = 0  # 当前执行的序列索引
+        self.auto_multi_sequence_running = False  # 自动多序列测试运行状态
 
-        self.auto_multi_pressure_points_var = tk.StringVar(
-            value=str(_pc_value("pressure_points_var", "1000,2000,3000"))
-        )
-        self.auto_multi_loop_mode_var = tk.StringVar(value=str(_pc_value("loop_mode_var", "顺序")))
-        self.auto_multi_loop_count_var = tk.IntVar(value=int(_pc_value("loop_count_var", 1)))
-        self.auto_multi_tolerance_var = tk.DoubleVar(
-            value=float(_pc_value("tolerance_var", DEFAULT_PRESS_MAE))
-        )
-        self.auto_multi_stable_time_var = tk.DoubleVar(value=float(_pc_value("stable_time_var", 10.0)))
-        self.auto_multi_step_interval_var = tk.DoubleVar(
-            value=float(_pc_value("pressure_step_interval_var", 60.0))
-        )
-        self.auto_multi_tcp_host_var = tk.StringVar(
-            value=str(_pc_value("multi_tcp_host_var", DEFAULT_MULTI_PRESSURE_HOST))
-        )
-        self.auto_multi_tcp_port_var = tk.IntVar(
-            value=int(_pc_value("multi_tcp_port_var", DEFAULT_MULTI_PRESSURE_PORT))
-        )
+        # 序列执行参数
+        self.auto_multi_sequence_points_var = tk.StringVar(value="")
+        self.auto_multi_sequence_status_var = tk.StringVar(value="未开始")
+        self.auto_multi_tolerance_var = tk.DoubleVar(value=DEFAULT_PRESS_MAE)
+        self.auto_multi_stable_time_var = tk.DoubleVar(value=10.0)
+        self.auto_multi_step_interval_var = tk.DoubleVar(value=60.0)
 
         self._external_log: Optional[Callable[[str], None]] = None
         self._use_internal_log = self._owns_window
@@ -706,7 +693,7 @@ class MultiSequenceApp(ttk.Frame):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
         self._bind_mousewheel(canvas)
 
-        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：压力/电流/序列量纲）")
+        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：电流）")
         matrix_frame.pack(fill=tk.X, pady=8)
 
         toolbar = ttk.Frame(matrix_frame)
@@ -714,7 +701,8 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Button(toolbar, text="添加温度列", command=self.add_temperature_column, bootstyle="outline-info").pack(
             side=tk.LEFT, padx=4
         )
-        ttk.Button(toolbar, text="删除温度列", command=self.remove_temperature_column, bootstyle="outline-secondary").pack(
+        ttk.Button(toolbar, text="删除温度列", command=self.remove_temperature_column,
+                   bootstyle="outline-secondary").pack(
             side=tk.LEFT, padx=4
         )
         ttk.Button(toolbar, text="添加电流行", command=self.add_current_row, bootstyle="outline-info").pack(
@@ -732,7 +720,8 @@ class MultiSequenceApp(ttk.Frame):
 
         matrix_actions = ttk.Frame(matrix_frame)
         matrix_actions.pack(fill=tk.X, pady=4)
-        ttk.Button(matrix_actions, text="开始执行", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT, padx=4)
+        ttk.Button(matrix_actions, text="开始执行", bootstyle=SUCCESS, command=self.start_plan).pack(side=tk.LEFT,
+                                                                                                     padx=4)
         ttk.Button(matrix_actions, text="停止", bootstyle=DANGER, command=self.stop_plan).pack(side=tk.LEFT, padx=4)
         ttk.Button(matrix_actions, text="导出结果", command=self.export_results, bootstyle="outline-primary").pack(
             side=tk.RIGHT, padx=4
@@ -780,53 +769,83 @@ class MultiSequenceApp(ttk.Frame):
         ).pack(side=tk.LEFT, padx=4)
         ttk.Label(
             record_frame,
-            text="规则：点击“开始执行”新建文件，任务结束后自动保存。",
+            text="规则：点击'开始执行'新建文件，任务结束后自动保存。",
             bootstyle=INFO,
             wraplength=680,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
+        # 自动多序列测试（基于测试矩阵）
         auto_frame = ttk.Labelframe(options_frame, text="自动多序列测试")
         auto_frame.pack(fill=tk.X, pady=6)
 
-        auto_row1 = ttk.Frame(auto_frame)
-        auto_row1.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row1, text="序列列表（逗号分隔）").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(auto_row1, textvariable=self.auto_multi_pressure_points_var, width=28).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(auto_row1, text="循环模式").pack(side=tk.LEFT, padx=4)
-        ttk.Combobox(auto_row1, textvariable=self.auto_multi_loop_mode_var, width=12,
-                     values=("顺序", "倒序", "顺序+倒序")).pack(side=tk.LEFT, padx=4)
+        # 序列生成和状态显示
+        seq_gen_row = ttk.Frame(auto_frame)
+        seq_gen_row.pack(fill=tk.X, pady=2)
+        ttk.Button(
+            seq_gen_row,
+            text="从测试矩阵生成序列",
+            command=self.generate_sequence_from_matrix,
+            bootstyle="outline-primary",
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_gen_row, text="状态：").pack(side=tk.LEFT, padx=(20, 4))
+        ttk.Label(seq_gen_row, textvariable=self.auto_multi_sequence_status_var, bootstyle=INFO).pack(side=tk.LEFT)
 
-        auto_row2 = ttk.Frame(auto_frame)
-        auto_row2.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row2, text="容差 / 阈值").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(auto_row2, textvariable=self.auto_multi_tolerance_var, width=8).pack(side=tk.LEFT, padx=4)
-        ttk.Label(auto_row2, text="判稳时间(s)").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(auto_row2, textvariable=self.auto_multi_stable_time_var, width=8).pack(side=tk.LEFT, padx=4)
-        ttk.Label(auto_row2, text="循环次数").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(auto_row2, textvariable=self.auto_multi_loop_count_var, width=6).pack(side=tk.LEFT, padx=4)
+        # 序列列表显示
+        seq_list_frame = ttk.Frame(auto_frame)
+        seq_list_frame.pack(fill=tk.X, pady=4)
 
-        auto_row3 = ttk.Frame(auto_frame)
-        auto_row3.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row3, text="序列间隔(s)").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(auto_row3, textvariable=self.auto_multi_step_interval_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(auto_row3, text="TCP主机").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_host_var, width=16).pack(side=tk.LEFT, padx=(4, 6))
-        ttk.Label(auto_row3, text="端口").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_port_var, width=8).pack(side=tk.LEFT, padx=(4, 0))
+        # 创建Treeview显示序列
+        columns = ("序号", "温度", "压力", "状态")
+        self.sequence_tree = ttk.Treeview(seq_list_frame, columns=columns, show="headings", height=6)
 
-        auto_btn_row = ttk.Frame(auto_frame)
-        auto_btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(auto_btn_row, text="启动多序列测试", command=self.start_auto_multi_sequence_test, bootstyle=SUCCESS).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Button(auto_btn_row, text="停止多序列测试", command=self.stop_auto_multi_sequence_test, bootstyle=DANGER).pack(
-            side=tk.LEFT
-        )
+        # 设置列标题
+        for col in columns:
+            self.sequence_tree.heading(col, text=col)
+            self.sequence_tree.column(col, width=80)
+
+        # 添加滚动条
+        seq_scrollbar = ttk.Scrollbar(seq_list_frame, orient=tk.VERTICAL, command=self.sequence_tree.yview)
+        self.sequence_tree.configure(yscrollcommand=seq_scrollbar.set)
+
+        self.sequence_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        seq_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 序列执行参数
+        seq_params_row1 = ttk.Frame(auto_frame)
+        seq_params_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(seq_params_row1, text="容差 / 阈值").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(seq_params_row1, textvariable=self.auto_multi_tolerance_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_params_row1, text="判稳时间(s)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(seq_params_row1, textvariable=self.auto_multi_stable_time_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_params_row1, text="序列间隔(s)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(seq_params_row1, textvariable=self.auto_multi_step_interval_var, width=8).pack(side=tk.LEFT, padx=4)
+
+        # 序列控制按钮
+        seq_btn_row = ttk.Frame(auto_frame)
+        seq_btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(
+            seq_btn_row,
+            text="开始自动多序列测试",
+            command=self.start_auto_multi_sequence_test,
+            bootstyle=SUCCESS,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(
+            seq_btn_row,
+            text="停止自动多序列测试",
+            command=self.stop_auto_multi_sequence_test,
+            bootstyle=DANGER,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            seq_btn_row,
+            text="清空序列",
+            command=self.clear_sequence_list,
+            bootstyle="outline-warning",
+        ).pack(side=tk.LEFT, padx=(20, 0))
 
         ttk.Label(
             auto_frame,
-            text="说明：这里配置的是“自动多序列测试”的参数，只负责把参数同步到压力控制程序并触发其内部逻辑。",
+            text="说明：根据测试矩阵生成测试序列，按照温度-压力的顺序自动执行所有测试点。",
             bootstyle=INFO,
             wraplength=680,
             justify=tk.LEFT,
@@ -866,35 +885,42 @@ class MultiSequenceApp(ttk.Frame):
         self.temp_conn_label.pack(side=tk.LEFT, padx=6)
         self.press_conn_label = ttk.Label(rt_row4, textvariable=self.press_conn_status, bootstyle=SECONDARY)
         self.press_conn_label.pack(side=tk.LEFT, padx=6)
-        ttk.Button(rt_row4, text="刷新连接", command=self.refresh_controller_status, bootstyle="outline-secondary").pack(
-            side=tk.LEFT, padx=(12, 0)
-        )
+        ttk.Button(
+            rt_row4,
+            text="刷新连接",
+            command=self.refresh_controller_status,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
+        # 图表区域：界面标题中文，内部曲线全部英文
         charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
-
 
         self._chart_fig = Figure(figsize=(10, 4.5), dpi=100)
         grid = self._chart_fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.28)
         ax_temp = self._chart_fig.add_subplot(grid[0, 0])
         ax_press = self._chart_fig.add_subplot(grid[0, 1])
 
-        ax_temp.set_title("温度随时间变化")
-        ax_temp.set_ylabel("温度 (°C)")
-        ax_temp.set_xlabel("时间 (s)")
-        self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="Actual Temperature")
+        ax_temp.set_title("Temperature Over Time")
+        ax_temp.set_ylabel("Temperature (°C)")
+        ax_temp.set_xlabel("Time (s)")
+        self._temp_line_actual, = ax_temp.plot(
+            [], [], color="#d62728", linewidth=1.6, label="Actual Temperature"
+        )
         self._temp_line_target, = ax_temp.plot(
             [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="Target Temperature"
         )
         ax_temp.grid(True, alpha=0.3)
         ax_temp.legend(loc="upper right", fontsize=8)
 
-        ax_press.set_title("压力/电流随时间变化")
-        ax_press.set_ylabel("压力 / 电流")
-        ax_press.set_xlabel("时间 (s)")
-        self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="Actual Pressure")
+        ax_press.set_title("Pressure / Current Over Time")
+        ax_press.set_ylabel("Pressure / Current")
+        ax_press.set_xlabel("Time (s)")
+        self._press_line_actual, = ax_press.plot(
+            [], [], color="#2ca02c", linewidth=1.6, label="Actual Pressure/Current"
+        )
         self._press_line_target, = ax_press.plot(
-            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="Target Pressure"
+            [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="Target Pressure/Current"
         )
         ax_press.grid(True, alpha=0.3)
         ax_press.legend(loc="upper right", fontsize=8)
@@ -982,6 +1008,273 @@ class MultiSequenceApp(ttk.Frame):
         for key in list(self.cell_labels.keys()):
             self._apply_cell_state(key, "pending")
 
+    # 自动多序列测试功能 --------------------------------------------------
+    def generate_sequence_from_matrix(self) -> None:
+        """从测试矩阵生成序列列表"""
+        try:
+            temperatures = self._collect_numbers(self.temperature_vars, "温度")
+            pressures = self._collect_numbers(self.current_vars, "电流")
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        if not temperatures or not pressures:
+            messagebox.showwarning("警告", "测试矩阵为空，请先配置温度和电流")
+            return
+
+        # 清空现有序列
+        self.sequence_list = []
+        for item in self.sequence_tree.get_children():
+            self.sequence_tree.delete(item)
+
+        # 按照温度-压力顺序生成序列
+        sequence_index = 1
+        for temp_idx, temperature in enumerate(temperatures):
+            for press_idx, pressure in enumerate(pressures):
+                sequence_item = {
+                    "index": sequence_index,
+                    "temperature": temperature,
+                    "pressure": pressure,
+                    "status": "pending",
+                    "temp_idx": temp_idx,
+                    "press_idx": press_idx
+                }
+                self.sequence_list.append(sequence_item)
+
+                # 添加到Treeview
+                self.sequence_tree.insert("", "end", values=(
+                    sequence_index,
+                    f"{temperature:.1f}",
+                    f"{pressure:.1f}",
+                    "待测"
+                ))
+                sequence_index += 1
+
+        self.auto_multi_sequence_status_var.set(f"已生成 {len(self.sequence_list)} 个测试序列")
+        self.log(f"从测试矩阵生成 {len(self.sequence_list)} 个测试序列")
+
+    def clear_sequence_list(self) -> None:
+        """清空序列列表"""
+        self.sequence_list = []
+        for item in self.sequence_tree.get_children():
+            self.sequence_tree.delete(item)
+        self.auto_multi_sequence_status_var.set("未开始")
+        self.log("已清空测试序列")
+
+    def update_sequence_status(self, index: int, status: str) -> None:
+        """更新序列状态"""
+        if 0 <= index < len(self.sequence_list):
+            self.sequence_list[index]["status"] = status
+
+            # 更新Treeview显示
+            items = self.sequence_tree.get_children()
+            if index < len(items):
+                item = items[index]
+                current_values = self.sequence_tree.item(item, "values")
+                if current_values:
+                    new_values = (
+                        current_values[0],  # 序号
+                        current_values[1],  # 温度
+                        current_values[2],  # 压力
+                        status  # 状态
+                    )
+                    self.sequence_tree.item(item, values=new_values)
+
+    def start_auto_multi_sequence_test(self) -> None:
+        """开始自动多序列测试"""
+        if not self.sequence_list:
+            messagebox.showwarning("警告", "请先生成测试序列")
+            return
+
+        ok, reason = self._preflight_check_controllers()
+        if not ok:
+            messagebox.showerror("连接失败", reason)
+            return
+
+        if not self._open_csv_session():
+            return
+
+        self.auto_multi_sequence_running = True
+        self.current_sequence_index = 0
+        self.auto_multi_sequence_status_var.set("运行中")
+
+        # 启动序列执行线程
+        threading.Thread(target=self._execute_sequences, daemon=True).start()
+        self.log("开始自动多序列测试")
+
+    def stop_auto_multi_sequence_test(self) -> None:
+        """停止自动多序列测试"""
+        self.auto_multi_sequence_running = False
+        self.auto_multi_sequence_status_var.set("已停止")
+        self.log("已停止自动多序列测试")
+
+    def _execute_sequences(self) -> None:
+        """执行序列的线程函数"""
+        temp_client = ControllerClient(
+            TEMP_DEFAULT_HOST,
+            TEMP_DEFAULT_PORT,
+            "温控",
+            handler=self._temp_handler,
+            lock=self._temp_handler_lock,
+        )
+        pressure_client = ControllerClient(
+            PRESS_DEFAULT_HOST,
+            PRESS_DEFAULT_PORT,
+            "压力",
+            handler=self._press_handler,
+            lock=self._press_handler_lock,
+        )
+
+        try:
+            for i, sequence in enumerate(self.sequence_list):
+                if not self.auto_multi_sequence_running:
+                    break
+
+                # 更新当前序列状态
+                self.current_sequence_index = i
+                self.update_sequence_status(i, "进行中")
+
+                temp = sequence["temperature"]
+                pressure = sequence["pressure"]
+
+                self.log(f"执行序列 {i + 1}/{len(self.sequence_list)}: 温度={temp}°C, 压力={pressure}")
+
+                # 设置温度并等待稳定
+                if not self._set_temperature_and_wait(temp_client, temp):
+                    self.update_sequence_status(i, "温度失败")
+                    continue
+
+                # 设置压力并等待稳定
+                if not self._set_pressure_and_wait(pressure_client, pressure):
+                    self.update_sequence_status(i, "压力失败")
+                    continue
+
+                # 记录结果
+                try:
+                    temp_status = temp_client.status().get("status", {})
+                    press_status = pressure_client.status().get("status", {})
+
+                    result = {
+                        "timestamp": time.time(),
+                        "sequence_index": i,
+                        "temperature": temp,
+                        "current": pressure,
+                        "pressure": pressure,
+                        "temp_status": temp_status,
+                        "pressure_status": press_status,
+                        "status": "completed",
+                    }
+                    self.add_result(result)
+                    self.append_csv_record(result)
+
+                    self.update_sequence_status(i, "完成")
+                    self.log(f"序列 {i + 1} 完成: 温度={temp}°C, 压力={pressure}")
+
+                except Exception as exc:
+                    self.log(f"记录结果失败: {exc}")
+                    self.update_sequence_status(i, "记录失败")
+
+                # 序列间隔
+                if i < len(self.sequence_list) - 1 and self.auto_multi_sequence_running:
+                    interval = self.auto_multi_step_interval_var.get()
+                    if interval > 0:
+                        self.log(f"等待序列间隔 {interval} 秒")
+                        time.sleep(interval)
+
+        except Exception as exc:
+            self.log(f"序列执行出错: {exc}")
+        finally:
+            self.auto_multi_sequence_running = False
+            self.auto_multi_sequence_status_var.set(
+                "已完成" if self.current_sequence_index == len(self.sequence_list) - 1 else "已停止")
+            self.log(f"自动多序列测试结束，共完成 {self.current_sequence_index + 1}/{len(self.sequence_list)} 个序列")
+            self._close_csv_session()
+
+    def _set_temperature_and_wait(self, client: ControllerClient, temperature: float) -> bool:
+        """设置温度并等待稳定"""
+        try:
+            # 设置温度目标
+            client.set_temperature(temperature, start=True)
+            client.start_pid()
+
+            self.log(f"设置温度目标: {temperature}°C")
+
+            # 等待温度稳定
+            timeout = self.cell_timeout_var.get()
+            stable_time = self.auto_multi_stable_time_var.get()
+            tolerance = self.auto_multi_tolerance_var.get()
+
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if not self.auto_multi_sequence_running:
+                    return False
+
+                status = client.status().get("status", {})
+                current_temp = self._safe_float(status.get("temperature"))
+                error = self._safe_float(status.get("error"))
+
+                if error is not None and abs(error) <= tolerance:
+                    self.log(f"温度稳定: {current_temp}°C, 误差: {error}")
+                    return True
+
+                time.sleep(1.0)
+
+            self.log(f"温度稳定超时: {temperature}°C")
+            return False
+
+        except Exception as exc:
+            self.log(f"温度控制失败: {exc}")
+            return False
+
+    def _set_pressure_and_wait(self, client: ControllerClient, pressure: float) -> bool:
+        """设置压力并等待稳定"""
+        try:
+            # 设置压力目标
+            client.set_pressure(pressure, start=True)
+            client.start_pressure()
+
+            self.log(f"设置压力目标: {pressure}")
+
+            # 等待压力稳定
+            timeout = self.cell_timeout_var.get()
+            stable_time = self.auto_multi_stable_time_var.get()
+            tolerance = self.auto_multi_tolerance_var.get()
+
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if not self.auto_multi_sequence_running:
+                    return False
+
+                status = client.status().get("status", {})
+                last = status.get("last", {}) if isinstance(status.get("last"), dict) else {}
+                error = self._safe_float(last.get("error"))
+
+                if error is not None and abs(error) <= tolerance:
+                    self.log(f"压力稳定: {pressure}, 误差: {error}")
+                    return True
+
+                time.sleep(1.0)
+
+            self.log(f"压力稳定超时: {pressure}")
+            return False
+
+        except Exception as exc:
+            self.log(f"压力控制失败: {exc}")
+            return False
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        """安全转换为float"""
+        try:
+            if value is None:
+                return None
+            f = float(value)
+            if f != f:  # 检查NaN
+                return None
+            return f
+        except Exception:
+            return None
+
     # Runner integration --------------------------------------------------
     def get_row_count(self) -> int:
         return len(self.current_vars)
@@ -996,11 +1289,11 @@ class MultiSequenceApp(ttk.Frame):
         self.after(0, lambda: self._apply_cell_state((row, col), "success"))
 
     def mark_cell_timeout(self, row: int, col: int, reason: str) -> None:
-        self.log(f"[{row+1}, {col+1}] 超时：{reason}")
+        self.log(f"[{row + 1}, {col + 1}] 超时：{reason}")
         self.after(0, lambda: self._apply_cell_state((row, col), "timeout"))
 
     def mark_cell_error(self, row: int, col: int, reason: str) -> None:
-        self.log(f"[{row+1}, {col+1}] 失败：{reason}")
+        self.log(f"[{row + 1}, {col + 1}] 失败：{reason}")
         self.after(0, lambda: self._apply_cell_state((row, col), "error"))
 
     def mark_column_error(self, col: int, reason: str) -> None:
@@ -1116,40 +1409,6 @@ class MultiSequenceApp(ttk.Frame):
                 return
             self.csv_dir.set(str(path))
             self.log(f"CSV 保存目录已设置为 {path}")
-
-    def start_auto_multi_sequence_test(self) -> None:
-        controller = self._pressure_controller
-        if controller is None:
-            messagebox.showerror("错误", "未关联压力控制程序，无法启动自动多序列测试")
-            return
-        try:
-            controller.pressure_points_var.set(self.auto_multi_pressure_points_var.get())
-            controller.loop_mode_var.set(self.auto_multi_loop_mode_var.get())
-            controller.loop_count_var.set(int(self.auto_multi_loop_count_var.get()))
-            controller.tolerance_var.set(float(self.auto_multi_tolerance_var.get()))
-            controller.stable_time_var.set(float(self.auto_multi_stable_time_var.get()))
-            controller.pressure_step_interval_var.set(float(self.auto_multi_step_interval_var.get()))
-            controller.multi_tcp_host_var.set(self.auto_multi_tcp_host_var.get().strip())
-            controller.multi_tcp_port_var.set(int(self.auto_multi_tcp_port_var.get()))
-        except Exception as exc:
-            messagebox.showerror("错误", f"参数格式错误：{exc}")
-            return
-        try:
-            controller.start_multi_pressure_test()
-            self.log("已请求启动自动多序列测试")
-        except Exception as exc:
-            messagebox.showerror("错误", f"启动自动多序列测试失败：{exc}")
-
-    def stop_auto_multi_sequence_test(self) -> None:
-        controller = self._pressure_controller
-        if controller is None:
-            messagebox.showerror("错误", "未关联压力控制程序，无法停止自动多序列测试")
-            return
-        try:
-            controller.stop_multi_pressure_test()
-            self.log("已请求停止自动多序列测试")
-        except Exception as exc:
-            self.log(f"停止自动多序列测试时出现错误：{exc}")
 
     def _bind_mousewheel(self, widget: tk.Widget) -> None:
         def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
@@ -1413,7 +1672,7 @@ class MultiSequenceApp(ttk.Frame):
         pressure_error = result.get("pressure_status", {}).get("last", {}).get("error")
         temp_error = result.get("temp_status", {}).get("error")
         self.log(
-            f"记录结果 行{result['row']+1}/列{result['col']+1}：温度={result['temperature']}, 电流={result['current']}, "
+            f"记录结果 行{result['row'] + 1}/列{result['col'] + 1}：温度={result['temperature']}, 电流={result['current']}, "
             f"温度误差={temp_error}, 压力误差={pressure_error}"
         )
 
@@ -1467,13 +1726,13 @@ class MultiSequenceApp(ttk.Frame):
         self.after(0, update_labels)
 
     def _fetch_status(
-        self,
-        host: str,
-        port: int,
-        name: str,
-        *,
-        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        lock: Optional[threading.RLock] = None,
+            self,
+            host: str,
+            port: int,
+            name: str,
+            *,
+            handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            lock: Optional[threading.RLock] = None,
     ) -> Optional[Dict]:
         try:
             client = ControllerClient(host, port, name, handler=handler, lock=lock)
@@ -1483,13 +1742,13 @@ class MultiSequenceApp(ttk.Frame):
             return {"__error__": str(exc)}
 
     def _ping_controller(
-        self,
-        name: str,
-        host: str,
-        port: int,
-        *,
-        handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        lock: Optional[threading.RLock] = None,
+            self,
+            name: str,
+            host: str,
+            port: int,
+            *,
+            handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            lock: Optional[threading.RLock] = None,
     ) -> Tuple[bool, str]:
         try:
             client = ControllerClient(host, port, name, handler=handler, lock=lock)
@@ -1537,11 +1796,11 @@ class MultiSequenceApp(ttk.Frame):
         return f
 
     def _append_history(
-        self,
-        history: Deque[Tuple[float, float, float]],
-        timestamp: float,
-        actual: float,
-        target: float,
+            self,
+            history: Deque[Tuple[float, float, float]],
+            timestamp: float,
+            actual: float,
+            target: float,
     ) -> None:
         if math.isnan(actual) and math.isnan(target):
             return
@@ -1560,10 +1819,10 @@ class MultiSequenceApp(ttk.Frame):
         return status.get("pressure")
 
     def _collect_chart_points(
-        self,
-        temp_status: Optional[Dict[str, Any]],
-        press_status: Optional[Dict[str, Any]],
-        timestamp: float,
+            self,
+            temp_status: Optional[Dict[str, Any]],
+            press_status: Optional[Dict[str, Any]],
+            timestamp: float,
     ) -> None:
         if temp_status and not temp_status.get("__error__"):
             actual = self._coerce_float(temp_status.get("temperature"))
@@ -1586,10 +1845,10 @@ class MultiSequenceApp(ttk.Frame):
         self._chart_fig.canvas.draw_idle()
 
     def _update_chart_lines(
-        self,
-        history: Deque[Tuple[float, float, float]],
-        line_actual,
-        line_target,
+            self,
+            history: Deque[Tuple[float, float, float]],
+            line_actual,
+            line_target,
     ) -> None:
         if line_actual is None or line_target is None:
             return
@@ -1658,6 +1917,7 @@ class MultiSequenceApp(ttk.Frame):
         if destroy_window is None:
             destroy_window = self._owns_window
         self.stop_plan()
+        self.stop_auto_multi_sequence_test()
         self._rt_stop.set()
         if self._rt_thread and self._rt_thread.is_alive():
             try:
