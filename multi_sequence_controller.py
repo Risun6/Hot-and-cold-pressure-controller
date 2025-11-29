@@ -1,6 +1,8 @@
 import csv
 import json
 import math
+import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -17,9 +19,162 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from tcp_utils import JSONLineClient
-from sim_click import capture_click_point, perform_click_async
 from PIL import Image, ImageChops
+
+import ctypes
+
+
+# =========================
+# TCP JSON 行协议（内置客户端）
+# =========================
+
+
+class JSONLineClient:
+    """发送单次 JSON 行请求的轻量客户端。"""
+
+    def __init__(self, host: str, port: int, timeout: float = 3.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+            sock.sendall(data)
+            sock.shutdown(socket.SHUT_WR)
+            sock.settimeout(self.timeout)
+            chunks = []
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    raise TimeoutError("no response from server")
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        text = b"".join(chunks).decode("utf-8").strip()
+        if not text:
+            raise ConnectionError("empty response")
+        line = text.splitlines()[-1]
+        return json.loads(line)
+
+
+# =========================
+# 模拟点击（内置）
+# =========================
+Point = Tuple[int, int]
+Reporter = Optional[Callable[[str], None]]
+
+
+def _get_cursor_pos() -> Point:
+    if pyautogui is not None:
+        pos = pyautogui.position()
+        return int(pos[0]), int(pos[1])
+    if sys.platform.startswith("win") and ctypes is not None:
+        class _POINT(ctypes.Structure):  # type: ignore[misc, valid-type]
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = _POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)) == 0:
+            raise RuntimeError("获取鼠标坐标失败")
+        return int(pt.x), int(pt.y)
+    raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法获取坐标")
+
+
+def capture_click_point(
+    master: tk.Misc,
+    *,
+    title: str = "设置点击点",
+    hint: str = "移动鼠标到目标处，按 Enter 键记录",
+    reporter: Reporter = None,
+) -> Optional[Point]:
+    """提示用户移动鼠标并按回车获取坐标。"""
+
+    top = tk.Toplevel(master)
+    top.title(title)
+    top.geometry("320x120")
+    top.transient(master.winfo_toplevel())
+    top.grab_set()
+    top.focus_force()
+
+    label = tk.Label(top, text=hint)
+    label.pack(expand=True)
+
+    result: Optional[Point] = None
+
+    def _finish(_: Optional[tk.Event] = None) -> None:
+        nonlocal result
+        try:
+            result = _get_cursor_pos()
+            if reporter:
+                reporter(f"已记录模拟点击点: {result}")
+        except Exception as exc:
+            messagebox.showerror("错误", f"获取坐标失败: {exc}")
+            result = None
+        finally:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+
+    top.bind("<Return>", _finish)
+    top.protocol("WM_DELETE_WINDOW", _finish)
+    top.wait_window()
+    return result
+
+
+def _click_once(x: int, y: int, button: str) -> None:
+    btn = (button or "left").lower()
+    if pyautogui is not None:
+        if btn not in ("left", "right", "middle"):
+            btn = "left"
+        pyautogui.click(x=int(x), y=int(y), button=btn)
+        return
+    if not sys.platform.startswith("win") or ctypes is None:
+        raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法模拟点击")
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.SetCursorPos(int(x), int(y))
+    mapping = {
+        "left": (0x0002, 0x0004),
+        "right": (0x0008, 0x0010),
+        "middle": (0x0020, 0x0040),
+    }
+    down, up = mapping.get(btn, mapping["left"])
+    user32.mouse_event(down, 0, 0, 0, 0)
+    user32.mouse_event(up, 0, 0, 0, 0)
+
+
+def perform_click_async(
+    x: int,
+    y: int,
+    *,
+    button: str = "left",
+    double: bool = False,
+    delay_ms: int = 0,
+    reporter: Reporter = None,
+) -> threading.Thread:
+    """后台线程执行模拟点击，避免阻塞 UI。"""
+
+    def _worker() -> None:
+        try:
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+            _click_once(int(x), int(y), button)
+            if double:
+                time.sleep(0.03)
+                _click_once(int(x), int(y), button)
+            if reporter:
+                reporter(
+                    f"已模拟点击：({int(x)}, {int(y)}) {button}{' 双击' if double else ''}".strip()
+                )
+        except Exception as exc:
+            if reporter:
+                reporter(f"执行模拟点击失败: {exc}")
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return thread
 
 try:
     import pyautogui
