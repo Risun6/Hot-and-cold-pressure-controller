@@ -589,7 +589,7 @@ class MultiSequenceApp(ttk.Frame):
         if hasattr(self._window, "title"):
             self._window.title("冷热平台多点自动测试")
         if hasattr(self._window, "geometry"):
-            self._window.geometry("960x720")
+            self._window.geometry("1100x760")
         if hasattr(self._window, "protocol"):
             self._window.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -706,7 +706,7 @@ class MultiSequenceApp(ttk.Frame):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
         self._bind_mousewheel(canvas)
 
-        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：电流）")
+        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：压力/电流/序列量纲）")
         matrix_frame.pack(fill=tk.X, pady=8)
 
         toolbar = ttk.Frame(matrix_frame)
@@ -786,12 +786,12 @@ class MultiSequenceApp(ttk.Frame):
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
-        auto_frame = ttk.Labelframe(options_frame, text="自动多压力测试")
+        auto_frame = ttk.Labelframe(options_frame, text="自动多序列测试")
         auto_frame.pack(fill=tk.X, pady=6)
 
         auto_row1 = ttk.Frame(auto_frame)
         auto_row1.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row1, text="压力点(g)").pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row1, text="序列列表（逗号分隔）").pack(side=tk.LEFT, padx=4)
         ttk.Entry(auto_row1, textvariable=self.auto_multi_pressure_points_var, width=28).pack(side=tk.LEFT, padx=(4, 10))
         ttk.Label(auto_row1, text="循环模式").pack(side=tk.LEFT, padx=4)
         ttk.Combobox(auto_row1, textvariable=self.auto_multi_loop_mode_var, width=12,
@@ -799,16 +799,16 @@ class MultiSequenceApp(ttk.Frame):
 
         auto_row2 = ttk.Frame(auto_frame)
         auto_row2.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row2, text="容差(g)").pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row2, text="容差 / 阈值").pack(side=tk.LEFT, padx=4)
         ttk.Entry(auto_row2, textvariable=self.auto_multi_tolerance_var, width=8).pack(side=tk.LEFT, padx=4)
-        ttk.Label(auto_row2, text="判稳(s)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Label(auto_row2, text="判稳时间(s)").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(auto_row2, textvariable=self.auto_multi_stable_time_var, width=8).pack(side=tk.LEFT, padx=4)
         ttk.Label(auto_row2, text="循环次数").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(auto_row2, textvariable=self.auto_multi_loop_count_var, width=6).pack(side=tk.LEFT, padx=4)
 
         auto_row3 = ttk.Frame(auto_frame)
         auto_row3.pack(fill=tk.X, pady=2)
-        ttk.Label(auto_row3, text="步进间隔(s)").pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row3, text="序列间隔(s)").pack(side=tk.LEFT, padx=4)
         ttk.Entry(auto_row3, textvariable=self.auto_multi_step_interval_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
         ttk.Label(auto_row3, text="TCP主机").pack(side=tk.LEFT, padx=4)
         ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_host_var, width=16).pack(side=tk.LEFT, padx=(4, 6))
@@ -817,12 +817,20 @@ class MultiSequenceApp(ttk.Frame):
 
         auto_btn_row = ttk.Frame(auto_frame)
         auto_btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(auto_btn_row, text="启动多压力测试", command=self.start_auto_multi_pressure_test, bootstyle=SUCCESS).pack(
+        ttk.Button(auto_btn_row, text="启动多序列测试", command=self.start_auto_multi_sequence_test, bootstyle=SUCCESS).pack(
             side=tk.LEFT, padx=(0, 10)
         )
-        ttk.Button(auto_btn_row, text="停止多压力测试", command=self.stop_auto_multi_pressure_test, bootstyle=DANGER).pack(
+        ttk.Button(auto_btn_row, text="停止多序列测试", command=self.stop_auto_multi_sequence_test, bootstyle=DANGER).pack(
             side=tk.LEFT
         )
+
+        ttk.Label(
+            auto_frame,
+            text="说明：这里配置的是“自动多序列测试”的参数，只负责把参数同步到压力控制程序并触发其内部逻辑。",
+            bootstyle=INFO,
+            wraplength=680,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
         realtime_frame = ttk.Labelframe(main, text="实时状态（来自温度/压力控制程序）")
         realtime_frame.pack(fill=tk.X, pady=8)
@@ -862,7 +870,7 @@ class MultiSequenceApp(ttk.Frame):
             side=tk.LEFT, padx=(12, 0)
         )
 
-        charts_frame = ttk.Labelframe(main, text="Live Charts (Last 5 Minutes)")
+        charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=8)
 
 
@@ -871,9 +879,9 @@ class MultiSequenceApp(ttk.Frame):
         ax_temp = self._chart_fig.add_subplot(grid[0, 0])
         ax_press = self._chart_fig.add_subplot(grid[0, 1])
 
-        ax_temp.set_title("Temperature Over Time")
-        ax_temp.set_ylabel("Temperature (°C)")
-        ax_temp.set_xlabel("Time (s)")
+        ax_temp.set_title("温度随时间变化")
+        ax_temp.set_ylabel("温度 (°C)")
+        ax_temp.set_xlabel("时间 (s)")
         self._temp_line_actual, = ax_temp.plot([], [], color="#d62728", linewidth=1.6, label="Actual Temperature")
         self._temp_line_target, = ax_temp.plot(
             [], [], color="#1f77b4", linestyle="--", linewidth=1.2, label="Target Temperature"
@@ -881,9 +889,9 @@ class MultiSequenceApp(ttk.Frame):
         ax_temp.grid(True, alpha=0.3)
         ax_temp.legend(loc="upper right", fontsize=8)
 
-        ax_press.set_title("Pressure Over Time")
-        ax_press.set_ylabel("Pressure")
-        ax_press.set_xlabel("Time (s)")
+        ax_press.set_title("压力/电流随时间变化")
+        ax_press.set_ylabel("压力 / 电流")
+        ax_press.set_xlabel("时间 (s)")
         self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="Actual Pressure")
         self._press_line_target, = ax_press.plot(
             [], [], color="#ff7f0e", linestyle="--", linewidth=1.2, label="Target Pressure"
@@ -1109,10 +1117,10 @@ class MultiSequenceApp(ttk.Frame):
             self.csv_dir.set(str(path))
             self.log(f"CSV 保存目录已设置为 {path}")
 
-    def start_auto_multi_pressure_test(self) -> None:
+    def start_auto_multi_sequence_test(self) -> None:
         controller = self._pressure_controller
         if controller is None:
-            messagebox.showerror("错误", "未关联压力控制程序，无法启动自动多压力测试")
+            messagebox.showerror("错误", "未关联压力控制程序，无法启动自动多序列测试")
             return
         try:
             controller.pressure_points_var.set(self.auto_multi_pressure_points_var.get())
@@ -1128,20 +1136,20 @@ class MultiSequenceApp(ttk.Frame):
             return
         try:
             controller.start_multi_pressure_test()
-            self.log("已请求启动自动多压力测试")
+            self.log("已请求启动自动多序列测试")
         except Exception as exc:
-            messagebox.showerror("错误", f"启动自动多压力测试失败：{exc}")
+            messagebox.showerror("错误", f"启动自动多序列测试失败：{exc}")
 
-    def stop_auto_multi_pressure_test(self) -> None:
+    def stop_auto_multi_sequence_test(self) -> None:
         controller = self._pressure_controller
         if controller is None:
-            messagebox.showerror("错误", "未关联压力控制程序，无法停止自动多压力测试")
+            messagebox.showerror("错误", "未关联压力控制程序，无法停止自动多序列测试")
             return
         try:
             controller.stop_multi_pressure_test()
-            self.log("已请求停止自动多压力测试")
+            self.log("已请求停止自动多序列测试")
         except Exception as exc:
-            self.log(f"停止自动多压力测试时出现错误：{exc}")
+            self.log(f"停止自动多序列测试时出现错误：{exc}")
 
     def _bind_mousewheel(self, widget: tk.Widget) -> None:
         def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
