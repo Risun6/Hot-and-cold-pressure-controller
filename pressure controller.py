@@ -1,3 +1,5 @@
+import ctypes
+import sys
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
@@ -12,6 +14,7 @@ import queue
 import math
 import matplotlib
 import numpy as np
+import socket
 import os
 import json
 import csv
@@ -21,17 +24,240 @@ from openpyxl.drawing.image import Image as XLImage
 from PIL import Image, ImageChops
 import pyautogui
 import atexit, signal
+from typing import Any, Callable, Dict, Optional, Tuple
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-from tcp_utils import JSONLineServer
-from sim_click import capture_click_point, perform_click_async
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 from pathlib import Path
+
+
+# =========================
+# TCP JSON 行协议（内置）
+# =========================
+Handler = Callable[[Dict[str, Any]], Dict[str, Any]]
+
+
+class JSONLineServer:
+    """轻量级 TCP 服务器：一行 JSON 请求对应一行响应。"""
+
+    def __init__(self, host: str, port: int, handler: Handler, name: str = "json-server"):
+        self.host = host
+        self.port = port
+        self._handler = handler
+        self._name = name
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._serve, name=f"{self._name}-thread", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        sock = self._sock
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=timeout)
+        self._sock = None
+
+    # ------------------------------------------------------------------
+    def _serve(self) -> None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
+                sock.listen(5)
+                sock.settimeout(1.0)
+                self._sock = sock
+                while not self._stop_event.is_set():
+                    try:
+                        conn, _ = sock.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    threading.Thread(
+                        target=self._handle_connection,
+                        name=f"{self._name}-client",
+                        args=(conn,),
+                        daemon=True,
+                    ).start()
+        finally:
+            self._sock = None
+
+    def _handle_connection(self, conn: socket.socket) -> None:
+        with conn:
+            conn.settimeout(5.0)
+            buffer = b""
+            while not self._stop_event.is_set():
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    response = self._dispatch(line)
+                    try:
+                        conn.sendall(response)
+                    except OSError:
+                        return
+
+    def _dispatch(self, raw: bytes) -> bytes:
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            payload = {"ok": False, "error": f"invalid json: {exc}"}
+            return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+
+        try:
+            result = self._handler(request) or {}
+            if "ok" not in result:
+                result["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - surface error to client
+            result = {"ok": False, "error": str(exc)}
+        return (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+# =========================
+# 模拟点击（内置）
+# =========================
+Point = Tuple[int, int]
+Reporter = Optional[Callable[[str], None]]
+
+
+def _get_cursor_pos() -> Point:
+    if pyautogui is not None:
+        pos = pyautogui.position()
+        return int(pos[0]), int(pos[1])
+    if sys.platform.startswith("win") and ctypes is not None:
+        class _POINT(ctypes.Structure):  # type: ignore[misc, valid-type]
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = _POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)) == 0:
+            raise RuntimeError("获取鼠标坐标失败")
+        return int(pt.x), int(pt.y)
+    raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法获取坐标")
+
+
+def capture_click_point(
+    master: tk.Misc,
+    *,
+    title: str = "设置点击点",
+    hint: str = "移动鼠标到目标处，按 Enter 键记录",
+    reporter: Reporter = None,
+) -> Optional[Point]:
+    """提示用户移动鼠标并按回车获取坐标。"""
+
+    top = tk.Toplevel(master)
+    top.title(title)
+    top.geometry("320x120")
+    top.transient(master.winfo_toplevel())
+    top.grab_set()
+    top.focus_force()
+
+    label = tk.Label(top, text=hint)
+    label.pack(expand=True)
+
+    result: Optional[Point] = None
+
+    def _finish(_: Optional[tk.Event] = None) -> None:
+        nonlocal result
+        try:
+            result = _get_cursor_pos()
+            if reporter:
+                reporter(f"已记录模拟点击点: {result}")
+        except Exception as exc:
+            messagebox.showerror("错误", f"获取坐标失败: {exc}")
+            result = None
+        finally:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+
+    top.bind("<Return>", _finish)
+    top.protocol("WM_DELETE_WINDOW", _finish)
+    top.wait_window()
+    return result
+
+
+def _click_once(x: int, y: int, button: str) -> None:
+    btn = (button or "left").lower()
+    if pyautogui is not None:
+        if btn not in ("left", "right", "middle"):
+            btn = "left"
+        pyautogui.click(x=int(x), y=int(y), button=btn)
+        return
+    if not sys.platform.startswith("win") or ctypes is None:
+        raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法模拟点击")
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.SetCursorPos(int(x), int(y))
+    mapping = {
+        "left": (0x0002, 0x0004),
+        "right": (0x0008, 0x0010),
+        "middle": (0x0020, 0x0040),
+    }
+    down, up = mapping.get(btn, mapping["left"])
+    user32.mouse_event(down, 0, 0, 0, 0)
+    user32.mouse_event(up, 0, 0, 0, 0)
+
+
+def perform_click_async(
+    x: int,
+    y: int,
+    *,
+    button: str = "left",
+    double: bool = False,
+    delay_ms: int = 0,
+    reporter: Reporter = None,
+) -> threading.Thread:
+    """后台线程执行模拟点击，避免阻塞 UI。"""
+
+    def _worker() -> None:
+        try:
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+            _click_once(int(x), int(y), button)
+            if double:
+                time.sleep(0.03)
+                _click_once(int(x), int(y), button)
+            if reporter:
+                reporter(
+                    f"已模拟点击：({int(x)}, {int(y)}) {button}{' 双击' if double else ''}".strip()
+                )
+        except Exception as exc:
+            if reporter:
+                reporter(f"执行模拟点击失败: {exc}")
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return thread
 
 def resolve_documents_dir() -> Path:
     home = Path.home()
