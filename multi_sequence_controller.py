@@ -19,10 +19,6 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from PIL import Image, ImageChops
-
-import ctypes
-
 
 # =========================
 # TCP JSON 行协议（内置客户端）
@@ -59,130 +55,6 @@ class JSONLineClient:
         return json.loads(line)
 
 
-# =========================
-# 模拟点击（内置）
-# =========================
-Point = Tuple[int, int]
-Reporter = Optional[Callable[[str], None]]
-
-
-def _get_cursor_pos() -> Point:
-    if pyautogui is not None:
-        pos = pyautogui.position()
-        return int(pos[0]), int(pos[1])
-    if sys.platform.startswith("win") and ctypes is not None:
-        class _POINT(ctypes.Structure):  # type: ignore[misc, valid-type]
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-        pt = _POINT()
-        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)) == 0:
-            raise RuntimeError("获取鼠标坐标失败")
-        return int(pt.x), int(pt.y)
-    raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法获取坐标")
-
-
-def capture_click_point(
-    master: tk.Misc,
-    *,
-    title: str = "设置点击点",
-    hint: str = "移动鼠标到目标处，按 Enter 键记录",
-    reporter: Reporter = None,
-) -> Optional[Point]:
-    """提示用户移动鼠标并按回车获取坐标。"""
-
-    top = tk.Toplevel(master)
-    top.title(title)
-    top.geometry("320x120")
-    top.transient(master.winfo_toplevel())
-    top.grab_set()
-    top.focus_force()
-
-    label = tk.Label(top, text=hint)
-    label.pack(expand=True)
-
-    result: Optional[Point] = None
-
-    def _finish(_: Optional[tk.Event] = None) -> None:
-        nonlocal result
-        try:
-            result = _get_cursor_pos()
-            if reporter:
-                reporter(f"已记录模拟点击点: {result}")
-        except Exception as exc:
-            messagebox.showerror("错误", f"获取坐标失败: {exc}")
-            result = None
-        finally:
-            try:
-                top.grab_release()
-            except Exception:
-                pass
-            top.destroy()
-
-    top.bind("<Return>", _finish)
-    top.protocol("WM_DELETE_WINDOW", _finish)
-    top.wait_window()
-    return result
-
-
-def _click_once(x: int, y: int, button: str) -> None:
-    btn = (button or "left").lower()
-    if pyautogui is not None:
-        if btn not in ("left", "right", "middle"):
-            btn = "left"
-        pyautogui.click(x=int(x), y=int(y), button=btn)
-        return
-    if not sys.platform.startswith("win") or ctypes is None:
-        raise RuntimeError("缺少 pyautogui 且非 Windows 平台，无法模拟点击")
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-    user32.SetCursorPos(int(x), int(y))
-    mapping = {
-        "left": (0x0002, 0x0004),
-        "right": (0x0008, 0x0010),
-        "middle": (0x0020, 0x0040),
-    }
-    down, up = mapping.get(btn, mapping["left"])
-    user32.mouse_event(down, 0, 0, 0, 0)
-    user32.mouse_event(up, 0, 0, 0, 0)
-
-
-def perform_click_async(
-    x: int,
-    y: int,
-    *,
-    button: str = "left",
-    double: bool = False,
-    delay_ms: int = 0,
-    reporter: Reporter = None,
-) -> threading.Thread:
-    """后台线程执行模拟点击，避免阻塞 UI。"""
-
-    def _worker() -> None:
-        try:
-            if delay_ms > 0:
-                time.sleep(delay_ms / 1000.0)
-            _click_once(int(x), int(y), button)
-            if double:
-                time.sleep(0.03)
-                _click_once(int(x), int(y), button)
-            if reporter:
-                reporter(
-                    f"已模拟点击：({int(x)}, {int(y)}) {button}{' 双击' if double else ''}".strip()
-                )
-        except Exception as exc:
-            if reporter:
-                reporter(f"执行模拟点击失败: {exc}")
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-    return thread
-
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = False
-except Exception:  # pragma: no cover - 依赖缺失时降级
-    pyautogui = None
-
-
 TEMP_DEFAULT_HOST = "127.0.0.1"
 TEMP_DEFAULT_PORT = 50010
 PRESS_DEFAULT_HOST = "127.0.0.1"
@@ -198,6 +70,8 @@ DEFAULT_PRESS_FLUCT_RANGE = 50.0
 DEFAULT_CELL_TIMEOUT = 300.0
 DEFAULT_CONFIRM_COUNT = 2
 REALTIME_REFRESH_S = 1.0
+DEFAULT_MULTI_PRESSURE_HOST = "127.0.0.1"
+DEFAULT_MULTI_PRESSURE_PORT = 50000
 CHART_HISTORY_SECONDS = 300.0
 
 CONFIG_DIRNAME = "PID_冷热台"
@@ -316,40 +190,11 @@ class SequenceRunner(threading.Thread):
         super().__init__(daemon=True)
         self.app = app
         self.plan = plan
-        self.pixel_region: Optional[Tuple[int, int, int, int]] = None
-        self.pixel_sensitivity = 5.0
-        self.pixel_timeout = 180.0
-        self.pixel_interval = 1.0
-        self.pixel_base = None
-        self.pixel_prev = None
-        self.pixel_log_enabled = False
-        self._last_click_ts = 0.0
         self.stop_event = threading.Event()
         self.temp_handler = temp_handler
         self.press_handler = press_handler
         self.temp_lock = temp_lock
         self.press_lock = press_lock
-
-        pixel_cfg = (self.plan.get("auto_test") or {}).get("pixel") or {}
-        region = pixel_cfg.get("region")
-        if isinstance(region, (list, tuple)) and len(region) == 4:
-            try:
-                self.pixel_region = tuple(int(v) for v in region)
-            except Exception:
-                self.pixel_region = None
-        try:
-            self.pixel_sensitivity = float(pixel_cfg.get("sensitivity", self.pixel_sensitivity))
-        except Exception:
-            pass
-        try:
-            self.pixel_timeout = float(pixel_cfg.get("timeout", self.pixel_timeout))
-        except Exception:
-            pass
-        try:
-            self.pixel_interval = max(0.05, float(pixel_cfg.get("interval_ms", 1000)) / 1000.0)
-        except Exception:
-            pass
-        self.pixel_log_enabled = bool(pixel_cfg.get("log_enabled", False))
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -599,106 +444,6 @@ class SequenceRunner(threading.Thread):
         self.app.add_result(result)
         self.app.append_csv_record(result)
 
-    def _capture_pixel_baseline(self) -> bool:
-        if pyautogui is None or not self.pixel_region:
-            return False
-        try:
-            snap = pyautogui.screenshot(region=self.pixel_region)
-            if snap.mode != "RGB":
-                snap = snap.convert("RGB")
-            self.pixel_base = snap
-            self.pixel_prev = None
-            return True
-        except Exception as exc:
-            self.log(f"基线截屏失败：{exc}")
-            return False
-
-    def _check_pixel_change(self) -> Tuple[bool, str]:
-        if not self.pixel_region:
-            return False, "未设置检测区域"
-        if pyautogui is None:
-            return False, "未安装 pyautogui，无法截屏"
-        if self.pixel_base is None:
-            if not self._capture_pixel_baseline():
-                return False, "尚未截取基线截图，无法检测"
-        try:
-            curr = pyautogui.screenshot(region=self.pixel_region)
-            if curr.mode != "RGB":
-                curr = curr.convert("RGB")
-            base = self.pixel_prev or self.pixel_base
-            if base is None:
-                base = curr
-            diff = ImageChops.difference(base, curr)
-            self.pixel_prev = curr
-            diff_data = diff.getdata()
-            diff_pixels = sum(1 for px in diff_data if px != (0, 0, 0))
-            total = curr.width * curr.height
-            pct = diff_pixels / total * 100 if total else 0
-            if pct >= self.pixel_sensitivity:
-                return True, f"检测到像素变化: {pct:.2f}%"
-            return False, f"无显著变化: {pct:.2f}%"
-        except Exception as exc:
-            return False, f"检测失败：{exc}"
-
-    def _wait_for_pixel_change(self) -> Tuple[bool, str]:
-        if not self.pixel_region:
-            return False, "未设置检测区域"
-        if not self._capture_pixel_baseline():
-            return False, "无法截取基线，跳过像素检测"
-        end_time = time.time() + max(0.0, self.pixel_timeout)
-        while not self.stop_event.is_set() and time.time() <= end_time:
-            changed, msg = self._check_pixel_change()
-            if self.pixel_log_enabled:
-                self.log(msg)
-            if changed:
-                self.app.after(0, lambda: self.app.set_indicator_color("green"))
-                return True, msg
-            self.stop_event.wait(self.pixel_interval)
-        return False, "像素检测超时"
-
-    def _maybe_sim_click(self) -> None:
-        auto_cfg = self.plan.get("auto_test") or {}
-        cfg = auto_cfg.get("sim_click") or {}
-        pixel_cfg = auto_cfg.get("pixel") or {}
-        if not isinstance(cfg, dict) or not cfg.get("enabled"):
-            return
-        point = cfg.get("point")
-        if not point or len(point) != 2:
-            self.log("模拟点击点未设置，跳过点击")
-            return
-        try:
-            repeat = max(1, int(cfg.get("repeat", 1)))
-        except Exception:
-            repeat = 1
-        try:
-            delay_ms = max(0, int(cfg.get("delay_ms", 0)))
-        except Exception:
-            delay_ms = 0
-        try:
-            cooldown_ms = max(0, int(cfg.get("cooldown_ms", 0)))
-        except Exception:
-            cooldown_ms = 0
-        now = time.time()
-        if cooldown_ms and now - self._last_click_ts < cooldown_ms / 1000.0:
-            self.log("模拟点击冷却中，跳过本轮触发")
-            return
-        for idx in range(repeat):
-            perform_click_async(int(point[0]), int(point[1]), delay_ms=delay_ms, reporter=self.log)
-            if cooldown_ms and idx < repeat - 1:
-                if self.stop_event.wait(cooldown_ms / 1000.0):
-                    break
-        self._last_click_ts = time.time()
-
-        if pixel_cfg.get("enabled"):
-            if not self.pixel_region:
-                self.log("已启用像素检测但未设置区域，跳过")
-                return
-            ok, msg = self._wait_for_pixel_change()
-            if ok:
-                self.log(f"像素检测完成：{msg}")
-            else:
-                self.log(msg)
-
     def run(self) -> None:
         temp_client = ControllerClient(
             self.plan["temp_host"],
@@ -787,7 +532,6 @@ class SequenceRunner(threading.Thread):
                             self.app.mark_cell_timeout(row, col, "压力超时")
                             continue
                         break
-                    self._maybe_sim_click()
                     temp_recheck, temp_recheck_timeout = self.wait_temperature(
                         temp_client,
                         t_thr,
@@ -885,21 +629,32 @@ class MultiSequenceApp(ttk.Frame):
         self._csv_path: Optional[Path] = None
         self._csv_has_data = False
 
-        self.sim_click_enabled = tk.BooleanVar(value=False)
-        self.sim_click_delay_var = tk.IntVar(value=0)
-        self.sim_click_repeat_var = tk.IntVar(value=2)
-        self.sim_click_cooldown_var = tk.IntVar(value=500)
-        self.sim_click_pos: Optional[Tuple[int, int]] = None
-        self.sim_click_display_var = tk.StringVar(value="未设置")
+        def _pc_value(name: str, fallback: Any) -> Any:
+            pc = self._pressure_controller
+            try:
+                var = getattr(pc, name)
+                return var.get()
+            except Exception:
+                return fallback
 
-        self.pixel_detection_enabled = tk.BooleanVar(value=False)
-        self.pixel_log_enabled = tk.BooleanVar(value=False)
-        self.pixel_sensitivity_var = tk.DoubleVar(value=5.0)
-        self.pixel_timeout_var = tk.DoubleVar(value=180.0)
-        self.detection_interval_var = tk.IntVar(value=1000)
-        self.pixel_detection_region: Optional[Tuple[int, int, int, int]] = None
-        self.initial_pixel_snapshot = None
-        self.prev_pixel_snapshot = None
+        self.auto_multi_pressure_points_var = tk.StringVar(
+            value=str(_pc_value("pressure_points_var", "1000,2000,3000"))
+        )
+        self.auto_multi_loop_mode_var = tk.StringVar(value=str(_pc_value("loop_mode_var", "顺序")))
+        self.auto_multi_loop_count_var = tk.IntVar(value=int(_pc_value("loop_count_var", 1)))
+        self.auto_multi_tolerance_var = tk.DoubleVar(
+            value=float(_pc_value("tolerance_var", DEFAULT_PRESS_MAE))
+        )
+        self.auto_multi_stable_time_var = tk.DoubleVar(value=float(_pc_value("stable_time_var", 10.0)))
+        self.auto_multi_step_interval_var = tk.DoubleVar(
+            value=float(_pc_value("pressure_step_interval_var", 60.0))
+        )
+        self.auto_multi_tcp_host_var = tk.StringVar(
+            value=str(_pc_value("multi_tcp_host_var", DEFAULT_MULTI_PRESSURE_HOST))
+        )
+        self.auto_multi_tcp_port_var = tk.IntVar(
+            value=int(_pc_value("multi_tcp_port_var", DEFAULT_MULTI_PRESSURE_PORT))
+        )
 
         self._external_log: Optional[Callable[[str], None]] = None
         self._use_internal_log = self._owns_window
@@ -1031,42 +786,43 @@ class MultiSequenceApp(ttk.Frame):
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
-        auto_frame = ttk.Labelframe(options_frame, text="自动测试")
+        auto_frame = ttk.Labelframe(options_frame, text="自动多压力测试")
         auto_frame.pack(fill=tk.X, pady=6)
 
-        pixel_row = ttk.Frame(auto_frame)
-        pixel_row.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(pixel_row, text="启用像素检测", variable=self.pixel_detection_enabled).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pixel_row, text="设置检测区域", command=self.set_pixel_detection_region, bootstyle="outline-info").pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Checkbutton(pixel_row, text="记录检测日志", variable=self.pixel_log_enabled).pack(side=tk.LEFT, padx=6)
-        self.indicator_canvas = tk.Canvas(pixel_row, width=18, height=18, highlightthickness=0)
-        self.indicator_circle = self.indicator_canvas.create_oval(2, 2, 16, 16, fill="red")
-        self.indicator_canvas.pack(side=tk.LEFT, padx=6)
-        ttk.Label(pixel_row, text="灵敏度(%)").pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Entry(pixel_row, textvariable=self.pixel_sensitivity_var, width=8).pack(side=tk.LEFT)
-        ttk.Label(pixel_row, text="超时(s)").pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Entry(pixel_row, textvariable=self.pixel_timeout_var, width=8).pack(side=tk.LEFT)
+        auto_row1 = ttk.Frame(auto_frame)
+        auto_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(auto_row1, text="压力点(g)").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(auto_row1, textvariable=self.auto_multi_pressure_points_var, width=28).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(auto_row1, text="循环模式").pack(side=tk.LEFT, padx=4)
+        ttk.Combobox(auto_row1, textvariable=self.auto_multi_loop_mode_var, width=12,
+                     values=("顺序", "倒序", "顺序+倒序")).pack(side=tk.LEFT, padx=4)
 
-        interval_row = ttk.Frame(auto_frame)
-        interval_row.pack(fill=tk.X, pady=2)
-        ttk.Label(interval_row, text="检测间隔(ms)").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(interval_row, textvariable=self.detection_interval_var, width=10).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(interval_row, text="点击冷却(ms)").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(interval_row, textvariable=self.sim_click_cooldown_var, width=10).pack(side=tk.LEFT)
+        auto_row2 = ttk.Frame(auto_frame)
+        auto_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(auto_row2, text="容差(g)").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(auto_row2, textvariable=self.auto_multi_tolerance_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row2, text="判稳(s)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(auto_row2, textvariable=self.auto_multi_stable_time_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row2, text="循环次数").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(auto_row2, textvariable=self.auto_multi_loop_count_var, width=6).pack(side=tk.LEFT, padx=4)
 
-        click_row = ttk.Frame(auto_frame)
-        click_row.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(click_row, text="稳定后执行模拟点击", variable=self.sim_click_enabled).pack(side=tk.LEFT, padx=4)
-        ttk.Button(click_row, text="设置点击点", command=self.set_sim_click_point, bootstyle="outline-info").pack(
-            side=tk.LEFT, padx=4
+        auto_row3 = ttk.Frame(auto_frame)
+        auto_row3.pack(fill=tk.X, pady=2)
+        ttk.Label(auto_row3, text="步进间隔(s)").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(auto_row3, textvariable=self.auto_multi_step_interval_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(auto_row3, text="TCP主机").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_host_var, width=16).pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(auto_row3, text="端口").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_port_var, width=8).pack(side=tk.LEFT, padx=(4, 0))
+
+        auto_btn_row = ttk.Frame(auto_frame)
+        auto_btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(auto_btn_row, text="启动多压力测试", command=self.start_auto_multi_pressure_test, bootstyle=SUCCESS).pack(
+            side=tk.LEFT, padx=(0, 10)
         )
-        ttk.Label(click_row, textvariable=self.sim_click_display_var, bootstyle=SECONDARY).pack(side=tk.LEFT, padx=6)
-        ttk.Label(click_row, text="延时(ms)").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(click_row, textvariable=self.sim_click_delay_var, width=7).pack(side=tk.LEFT)
-        ttk.Label(click_row, text="重复次数").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(click_row, textvariable=self.sim_click_repeat_var, width=5).pack(side=tk.LEFT)
+        ttk.Button(auto_btn_row, text="停止多压力测试", command=self.stop_auto_multi_pressure_test, bootstyle=DANGER).pack(
+            side=tk.LEFT
+        )
 
         realtime_frame = ttk.Labelframe(main, text="实时状态（来自温度/压力控制程序）")
         realtime_frame.pack(fill=tk.X, pady=8)
@@ -1282,42 +1038,6 @@ class MultiSequenceApp(ttk.Frame):
             "press_settle_window": press_window,
             "press_settle_range": press_fluct_range,
         }
-        try:
-            delay_ms = max(0, int(self.sim_click_delay_var.get()))
-        except Exception:
-            delay_ms = 0
-        try:
-            repeat = max(1, int(self.sim_click_repeat_var.get()))
-        except Exception:
-            repeat = 1
-        try:
-            cooldown = max(0, int(self.sim_click_cooldown_var.get()))
-        except Exception:
-            cooldown = 0
-        sim_enabled = bool(self.sim_click_enabled.get())
-        if sim_enabled and not self.sim_click_pos:
-            raise ValueError("请先设置模拟点击点")
-        auto_test = {
-            "sim_click": {
-                "enabled": sim_enabled,
-                "point": list(self.sim_click_pos) if self.sim_click_pos else None,
-                "delay_ms": delay_ms,
-                "repeat": repeat,
-                "cooldown_ms": cooldown,
-            },
-            "pixel": {
-                "enabled": bool(self.pixel_detection_enabled.get()),
-                "region": list(self.pixel_detection_region) if self.pixel_detection_region else None,
-                "sensitivity": float(self.pixel_sensitivity_var.get()),
-                "timeout": float(self.pixel_timeout_var.get()),
-                "interval_ms": int(self.detection_interval_var.get()),
-                "log_enabled": bool(self.pixel_log_enabled.get()),
-            },
-        }
-        if auto_test["pixel"]["enabled"] and not auto_test["pixel"]["region"]:
-            raise ValueError("请先设置像素检测区域")
-        plan["auto_test"] = auto_test
-        plan["sim_click"] = auto_test["sim_click"]
         return plan
 
     def _preflight_check_controllers(self) -> Tuple[bool, str]:
@@ -1376,114 +1096,6 @@ class MultiSequenceApp(ttk.Frame):
                 continue
         return float(fallback)
 
-    def set_sim_click_point(self) -> None:
-        pos = capture_click_point(
-            self,
-            title="设置模拟点击点",
-            hint="移动鼠标到目标软件按钮处，按 Enter 键记录",
-            reporter=self.log,
-        )
-        if pos:
-            self.sim_click_pos = (int(pos[0]), int(pos[1]))
-            self.sim_click_display_var.set(f"{int(pos[0])}, {int(pos[1])}")
-        else:
-            self.sim_click_display_var.set("未设置")
-
-    def set_indicator_color(self, color: str) -> None:
-        try:
-            self.indicator_canvas.itemconfig(self.indicator_circle, fill=color)
-            if color == "green":
-                self.after(600, lambda: self.set_indicator_color("red"))
-        except Exception:
-            pass
-
-    def _capture_pixel_baseline(self) -> bool:
-        if pyautogui is None or not self.pixel_detection_region:
-            return False
-        try:
-            snap = pyautogui.screenshot(region=self.pixel_detection_region)
-            if snap.mode != "RGB":
-                snap = snap.convert("RGB")
-            self.initial_pixel_snapshot = snap
-            self.prev_pixel_snapshot = None
-            return True
-        except Exception as exc:
-            self.log(f"基线截图失败：{exc}")
-            return False
-
-    def set_pixel_detection_region(self) -> None:
-        messagebox.showinfo("设置检测区域", "请用鼠标框选需要检测的屏幕区域，按 Enter 键确认。")
-        overlay = tk.Toplevel(self)
-        overlay.attributes("-fullscreen", True)
-        overlay.attributes("-alpha", 0.3)
-        overlay.attributes("-topmost", True)
-        overlay.configure(background="gray")
-        overlay.grab_set()
-        overlay.focus_force()
-
-        canvas = tk.Canvas(overlay, cursor="cross", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
-        canvas.focus_set()
-
-        coords = {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0, 'rect': None}
-
-        def on_press(event: tk.Event) -> None:  # type: ignore[type-arg]
-            coords['x1'], coords['y1'] = event.x, event.y
-            if coords['rect']:
-                canvas.delete(coords['rect'])
-            coords['rect'] = canvas.create_rectangle(coords['x1'], coords['y1'], event.x, event.y, outline="red", width=2)
-
-        def on_drag(event: tk.Event) -> None:  # type: ignore[type-arg]
-            canvas.coords(coords['rect'], coords['x1'], coords['y1'], event.x, event.y)
-
-        def on_release(event: tk.Event) -> None:  # type: ignore[type-arg]
-            coords['x2'], coords['y2'] = event.x, event.y
-
-        def on_enter(event=None):
-            overlay.grab_release()
-            x1, y1 = coords['x1'], coords['y1']
-            x2, y2 = coords['x2'], coords['y2']
-            left, right = sorted((x1, x2))
-            top, bottom = sorted((y1, y2))
-            width = max(0, right - left)
-            height = max(0, bottom - top)
-            abs_x = overlay.winfo_rootx() + left
-            abs_y = overlay.winfo_rooty() + top
-
-            try:
-                if width <= 0 or height <= 0:
-                    raise ValueError('selected area too small')
-
-                try:
-                    screen_w, screen_h = pyautogui.size() if pyautogui else (None, None)
-                except Exception:
-                    screen_w = screen_h = None
-
-                if screen_w is not None and screen_h is not None:
-                    abs_x = max(0, min(abs_x, screen_w - 1))
-                    abs_y = max(0, min(abs_y, screen_h - 1))
-                    width = min(width, max(0, screen_w - abs_x))
-                    height = min(height, max(0, screen_h - abs_y))
-                    if width <= 0 or height <= 0:
-                        raise ValueError('selected area too small')
-
-                region = (int(abs_x), int(abs_y), int(width), int(height))
-                self.pixel_detection_region = region
-                if self._capture_pixel_baseline():
-                    self.log(f"像素检测区域已设置：{region}")
-                else:
-                    self.log(f"像素区域已设置：{region}（未能截取基线）")
-            finally:
-                overlay.destroy()
-
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        canvas.bind("<Return>", on_enter)
-        canvas.bind("<Escape>", lambda e=None: overlay.destroy())
-        overlay.bind("<Return>", on_enter)
-        overlay.bind("<Escape>", lambda e=None: overlay.destroy())
-
     def _choose_csv_dir(self) -> None:
         current = self.csv_dir.get().strip() or str(get_logs_dir())
         selected = filedialog.askdirectory(initialdir=current, title="选择 CSV 保存目录")
@@ -1496,6 +1108,40 @@ class MultiSequenceApp(ttk.Frame):
                 return
             self.csv_dir.set(str(path))
             self.log(f"CSV 保存目录已设置为 {path}")
+
+    def start_auto_multi_pressure_test(self) -> None:
+        controller = self._pressure_controller
+        if controller is None:
+            messagebox.showerror("错误", "未关联压力控制程序，无法启动自动多压力测试")
+            return
+        try:
+            controller.pressure_points_var.set(self.auto_multi_pressure_points_var.get())
+            controller.loop_mode_var.set(self.auto_multi_loop_mode_var.get())
+            controller.loop_count_var.set(int(self.auto_multi_loop_count_var.get()))
+            controller.tolerance_var.set(float(self.auto_multi_tolerance_var.get()))
+            controller.stable_time_var.set(float(self.auto_multi_stable_time_var.get()))
+            controller.pressure_step_interval_var.set(float(self.auto_multi_step_interval_var.get()))
+            controller.multi_tcp_host_var.set(self.auto_multi_tcp_host_var.get().strip())
+            controller.multi_tcp_port_var.set(int(self.auto_multi_tcp_port_var.get()))
+        except Exception as exc:
+            messagebox.showerror("错误", f"参数格式错误：{exc}")
+            return
+        try:
+            controller.start_multi_pressure_test()
+            self.log("已请求启动自动多压力测试")
+        except Exception as exc:
+            messagebox.showerror("错误", f"启动自动多压力测试失败：{exc}")
+
+    def stop_auto_multi_pressure_test(self) -> None:
+        controller = self._pressure_controller
+        if controller is None:
+            messagebox.showerror("错误", "未关联压力控制程序，无法停止自动多压力测试")
+            return
+        try:
+            controller.stop_multi_pressure_test()
+            self.log("已请求停止自动多压力测试")
+        except Exception as exc:
+            self.log(f"停止自动多压力测试时出现错误：{exc}")
 
     def _bind_mousewheel(self, widget: tk.Widget) -> None:
         def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
