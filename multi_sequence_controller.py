@@ -545,6 +545,14 @@ class SequenceRunner(threading.Thread):
                             self.app.mark_cell_timeout(row, col, "温度复检超时")
                             continue
                         break
+                    if self.plan.get("use_multi_pressure"):
+                        multi_ok = self.app.run_multi_pressure_sequence(self.stop_event)
+                        if self.stop_event.is_set():
+                            break
+                        if not multi_ok:
+                            self.app.mark_cell_error(row, col, "多压力失败")
+                            continue
+
                     self._record_result(row, col, temp_target, current_target, temp_recheck, press_status)
                     self.app.mark_cell_done(row, col)
         finally:
@@ -655,6 +663,7 @@ class MultiSequenceApp(ttk.Frame):
         self.auto_multi_tcp_port_var = tk.IntVar(
             value=int(_pc_value("multi_tcp_port_var", DEFAULT_MULTI_PRESSURE_PORT))
         )
+        self.use_multi_pressure_var = tk.BooleanVar(value=False)
 
         self._external_log: Optional[Callable[[str], None]] = None
         self._use_internal_log = self._owns_window
@@ -815,6 +824,15 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Label(auto_row3, text="端口").pack(side=tk.LEFT, padx=4)
         ttk.Entry(auto_row3, textvariable=self.auto_multi_tcp_port_var, width=8).pack(side=tk.LEFT, padx=(4, 0))
 
+        auto_row4 = ttk.Frame(auto_frame)
+        auto_row4.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(
+            auto_row4,
+            text="温度/压力判稳后自动启动多压力测试",
+            variable=self.use_multi_pressure_var,
+            bootstyle="round-toggle",
+        ).pack(side=tk.LEFT, padx=4)
+
         auto_btn_row = ttk.Frame(auto_frame)
         auto_btn_row.pack(fill=tk.X, pady=4)
         ttk.Button(auto_btn_row, text="启动多序列测试", command=self.start_auto_multi_sequence_test, bootstyle=SUCCESS).pack(
@@ -868,6 +886,9 @@ class MultiSequenceApp(ttk.Frame):
         self.press_conn_label.pack(side=tk.LEFT, padx=6)
         ttk.Button(rt_row4, text="刷新连接", command=self.refresh_controller_status, bootstyle="outline-secondary").pack(
             side=tk.LEFT, padx=(12, 0)
+        )
+        ttk.Button(rt_row4, text="连通性自检", command=self.show_connectivity_checklist, bootstyle="outline-info").pack(
+            side=tk.LEFT, padx=6
         )
 
         charts_frame = ttk.Labelframe(main, text="实时曲线（最近 5 分钟）")
@@ -980,7 +1001,19 @@ class MultiSequenceApp(ttk.Frame):
 
     def reset_matrix_statuses(self) -> None:
         for key in list(self.cell_labels.keys()):
-            self._apply_cell_state(key, "pending")
+        self._apply_cell_state(key, "pending")
+
+    def show_connectivity_checklist(self) -> None:
+        checklist = [
+            "1. 启动 2400 程序，日志应出现 `TCP 从机监听 127.0.0.1:50000`（或你配置的端口）",
+            "2. 打开压力控制程序，在“多压力 / TCP 主机”点击“测试主机”，看到“TCP 主机连接成功”",
+            "3. 打开温控程序，确认多序列界面左下角“温控正常 / 压力正常”均为绿色",
+            "4. 在多序列程序填一个简单计划，确认实时曲线能刷到温度/压力变化",
+            "5. 点击“自动多序列测试”，输入压力点，观察压力 App 日志是否打印启动/保持/完成",
+            "6. 检查 2400 日志：会话重置、设定压力、完成提示是否出现，并生成 MULTI_PRESS_*.csv",
+            "以上步骤全部通过，则三段通信链路均正常",
+        ]
+        messagebox.showinfo("连通性自检小抄", "\n".join(checklist))
 
     # Runner integration --------------------------------------------------
     def get_row_count(self) -> int:
@@ -1045,6 +1078,7 @@ class MultiSequenceApp(ttk.Frame):
             "repeat_confirm": confirm_need,
             "press_settle_window": press_window,
             "press_settle_range": press_fluct_range,
+            "use_multi_pressure": bool(self.use_multi_pressure_var.get()),
         }
         return plan
 
@@ -1150,6 +1184,60 @@ class MultiSequenceApp(ttk.Frame):
             self.log("已请求停止自动多序列测试")
         except Exception as exc:
             self.log(f"停止自动多序列测试时出现错误：{exc}")
+
+    def run_multi_pressure_sequence(self, stop_event: threading.Event) -> bool:
+        controller = self._pressure_controller
+        if controller is None:
+            self.log("未关联压力控制程序，无法自动运行多压力测试")
+            return False
+
+        started = {"ok": False}
+        start_event = threading.Event()
+
+        def _start() -> None:
+            try:
+                self.start_auto_multi_sequence_test()
+                started["ok"] = bool(getattr(controller, "multi_pressure_running", False))
+            except Exception as exc:  # noqa: BLE001
+                started["error"] = str(exc)
+            finally:
+                start_event.set()
+
+        self.after(0, _start)
+        if not start_event.wait(timeout=3.0):
+            self.log("等待多压力启动超时")
+            return False
+
+        if not started.get("ok"):
+            err = started.get("error")
+            if err:
+                self.log(f"多压力启动失败：{err}")
+            else:
+                self.log("多压力未能启动")
+            return False
+
+        self.log("多压力测试已启动，等待完成…")
+        while getattr(controller, "multi_pressure_running", False):
+            if stop_event.is_set():
+                self.log("收到停止信号，中断多压力测试")
+                try:
+                    self.after(0, controller.stop_multi_pressure_test)
+                except Exception:
+                    pass
+                return False
+            time.sleep(0.5)
+
+        if stop_event.is_set():
+            return False
+
+        runner = getattr(controller, "multi_pressure_runner", None)
+        state = getattr(runner, "state", None)
+        if state and state != "COMPLETE":
+            self.log("多压力测试未正常结束")
+            return False
+
+        self.log("多压力测试完成")
+        return True
 
     def _bind_mousewheel(self, widget: tk.Widget) -> None:
         def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
@@ -1658,6 +1746,14 @@ class MultiSequenceApp(ttk.Frame):
         if destroy_window is None:
             destroy_window = self._owns_window
         self.stop_plan()
+        for name, host, port in (
+            ("温控", TEMP_DEFAULT_HOST, TEMP_DEFAULT_PORT),
+            ("压力", PRESS_DEFAULT_HOST, PRESS_DEFAULT_PORT),
+        ):
+            try:
+                ControllerClient(host, port, name).stop_all()
+            except Exception as exc:
+                self.log(f"{name} 停止指令发送失败：{exc}")
         self._rt_stop.set()
         if self._rt_thread and self._rt_thread.is_alive():
             try:

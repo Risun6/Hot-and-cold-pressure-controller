@@ -218,7 +218,7 @@ class MultiPressureRunner(threading.Thread):
                             self.app.log("发送压力值失败，停止多压力测试")
                             self.stop()
                             break
-                        if not self.tcp_client.send_run_and_wait_next(self._stop):
+                        if not self.tcp_client.send_run_and_wait_next(self._stop, timeout=120.0):
                             self.app.log("TCP 主机交互失败，停止多压力测试")
                             self.stop()
                             break
@@ -384,8 +384,12 @@ class JSONLineServer:
                 else:
                     try:
                         result = self.handler(payload)
-                        response = {"ok": True, "data": result}
+                        if isinstance(result, dict) and "ok" in result:
+                            response = result
+                        else:
+                            response = {"ok": True, "data": result}
                     except Exception as exc:  # noqa: BLE001
+                        self._log(f"handler error: {exc}")
                         response = {"ok": False, "error": str(exc)}
                 try:
                     file.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -870,6 +874,12 @@ class MultiPressureHostClient:
             self._log("发送 done 失败")
         return ok
 
+    def send_error(self, message: str) -> bool:
+        ok = self._send_line(f"error {message}")
+        if not ok:
+            self._log("发送 error 失败")
+        return ok
+
     def _wait_for_next(self, stop_event: threading.Event, *, timeout: Optional[float] = None) -> bool:
         if not self.connect():
             return False
@@ -910,11 +920,11 @@ class MultiPressureHostClient:
                     return False
                 self._log(f"忽略未知 TCP 响应: {line!r}")
 
-    def send_run_and_wait_next(self, stop_event: threading.Event) -> bool:
+    def send_run_and_wait_next(self, stop_event: threading.Event, *, timeout: Optional[float] = 120.0) -> bool:
         if not self._send_line("run"):
             return False
         self._log("已发送 run，等待 next…")
-        return self._wait_for_next(stop_event)
+        return self._wait_for_next(stop_event, timeout=timeout)
 
 
 
@@ -2228,6 +2238,13 @@ class App(ttk.Frame):
         except ValueError:
             messagebox.showerror("错误", "参数格式错误，请确认数值")
             return
+
+        if tcp_host and tcp_port:
+            precheck_client = MultiPressureHostClient(tcp_host, tcp_port, logger=self.log, timeout=1.0)
+            if not precheck_client.connect():
+                messagebox.showerror("连接失败", "TCP 主机不可达，请检查 2400 是否运行 / 端口是否一致")
+                return
+            precheck_client.close()
 
         self._maybe_prompt_auto_tare()
         self.multi_pressure_running = True
@@ -4853,6 +4870,19 @@ class App(ttk.Frame):
                 self.save_config()
             except Exception as e:
                 self.log(f"关闭前保存配置失败: {e}")
+
+            if self.multi_pressure_running:
+                self.log("应用退出，中止多压力会话")
+                runner = self.multi_pressure_runner
+                try:
+                    if runner and getattr(runner, "tcp_client", None):
+                        runner.tcp_client.send_error("app_shutdown")
+                except Exception:
+                    pass
+                try:
+                    self.stop_multi_pressure_test()
+                except Exception:
+                    pass
 
             try:
                 self.stop_all()
