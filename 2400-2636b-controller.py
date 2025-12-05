@@ -218,6 +218,9 @@ class KeithleyInstrument:
                     else:
                         self.session.write(f"SENS:VOLT:PROT {comp_val}")
                     self.session.write("OUTP ON")
+            except Exception:
+                # 避免底层异常炸掉上层流程
+                pass
 
     def prepare_source_2636(self, mode, compliance):
         """为 2636B 进行一次性源配置，减少循环内重复命令。"""
@@ -259,8 +262,6 @@ class KeithleyInstrument:
                     self.session.write(f"smua.source.levelv = {level_val}")
                 else:
                     self.session.write(f"smua.source.leveli = {level_val}")
-            except Exception:
-                pass
             except Exception:
                 # 不让底层异常直接炸掉上层流程
                 pass
