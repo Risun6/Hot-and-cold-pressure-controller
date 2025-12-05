@@ -218,6 +218,49 @@ class KeithleyInstrument:
                     else:
                         self.session.write(f"SENS:VOLT:PROT {comp_val}")
                     self.session.write("OUTP ON")
+
+    def prepare_source_2636(self, mode, compliance):
+        """为 2636B 进行一次性源配置，减少循环内重复命令。"""
+        with self.lock:
+            if self.simulated or self.session is None:
+                return
+
+            try:
+                comp_val = float(compliance)
+            except Exception:
+                return
+
+            try:
+                if mode == "Voltage":
+                    self.session.write("smua.source.func = smua.OUTPUT_DCVOLTS")
+                    self.session.write(f"smua.source.limiti = {comp_val}")
+                else:
+                    self.session.write("smua.source.func = smua.OUTPUT_DCAMPS")
+                    self.session.write(f"smua.source.limitv = {comp_val}")
+                self.session.write("smua.source.output = smua.OUTPUT_ON")
+            except Exception:
+                pass
+
+    def set_level_2636(self, mode, level):
+        """仅设置 2636B 源电平，避免重复配置其他属性。"""
+        with self.lock:
+            try:
+                level_val = float(level)
+            except Exception:
+                return
+
+            self.last_setpoint = level_val
+
+            if self.simulated or self.session is None:
+                return
+
+            try:
+                if mode == "Voltage":
+                    self.session.write(f"smua.source.levelv = {level_val}")
+                else:
+                    self.session.write(f"smua.source.leveli = {level_val}")
+            except Exception:
+                pass
             except Exception:
                 # 不让底层异常直接炸掉上层流程
                 pass
@@ -642,7 +685,7 @@ class App:
         self.iv_points_var = tk.IntVar(value=101)
         self.iv_cycles_var = tk.IntVar(value=1)
         self.iv_backforth_var = tk.BooleanVar(value=False)
-        self.iv_delay_var = tk.DoubleVar(value=0.1)
+        self.iv_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
         self.iv_quality_jump_ratio_var = tk.DoubleVar(value=0.02)
@@ -782,7 +825,7 @@ class App:
             inner.columnconfigure(col, weight=weight)
 
         self.it_bias_var = tk.DoubleVar(value=0.0)
-        self.it_delay_var = tk.DoubleVar(value=0.1)
+        self.it_delay_var = tk.DoubleVar(value=0.0)
         self.it_points_var = tk.IntVar(value=50)
         self.it_infinite_var = tk.BooleanVar(value=False)
         self.it_compliance_var = tk.DoubleVar(value=0.1)
@@ -819,7 +862,7 @@ class App:
             inner.columnconfigure(col, weight=weight)
 
         self.vt_bias_var = tk.DoubleVar(value=0.0)
-        self.vt_delay_var = tk.DoubleVar(value=0.1)
+        self.vt_delay_var = tk.DoubleVar(value=0.0)
         self.vt_points_var = tk.IntVar(value=50)
         self.vt_infinite_var = tk.BooleanVar(value=False)
         self.vt_compliance_var = tk.DoubleVar(value=10.0)
@@ -856,7 +899,7 @@ class App:
             inner.columnconfigure(col, weight=weight)
 
         self.rt_bias_var = tk.DoubleVar(value=0.0)
-        self.rt_delay_var = tk.DoubleVar(value=0.1)
+        self.rt_delay_var = tk.DoubleVar(value=0.0)
         self.rt_points_var = tk.IntVar(value=50)
         self.rt_infinite_var = tk.BooleanVar(value=False)
         self.rt_compliance_var = tk.DoubleVar(value=0.1)
@@ -893,7 +936,7 @@ class App:
             inner.columnconfigure(col, weight=weight)
 
         self.pt_bias_var = tk.DoubleVar(value=0.0)
-        self.pt_delay_var = tk.DoubleVar(value=0.1)
+        self.pt_delay_var = tk.DoubleVar(value=0.0)
         self.pt_points_var = tk.IntVar(value=50)
         self.pt_infinite_var = tk.BooleanVar(value=False)
         self.pt_compliance_var = tk.DoubleVar(value=0.1)
@@ -1111,10 +1154,15 @@ class App:
                 self._log("TCP 请求被忽略：未连接仪器")
             return False
 
+        model = getattr(self.instrument, "model", None)
         try:
             nplc = float(self.integration_time_var.get())
         except Exception:
             nplc = 0.0
+
+        if nplc <= 0:
+            nplc = 0.01 if model == "2636B" else 0.1
+
         try:
             self.instrument.set_nplc(nplc)
         except Exception:
@@ -1189,12 +1237,19 @@ class App:
             one_cycle = base_forward
 
         seq = np.tile(one_cycle, cycles)
-        self.instrument.configure_source(source_mode, float(seq[0]), compliance)
+        is_2636b = self.instrument.model == "2636B"
+        if is_2636b:
+            self.instrument.prepare_source_2636(source_mode, compliance)
+        else:
+            self.instrument.configure_source(source_mode, float(seq[0]), compliance)
 
         for idx, level in enumerate(seq):
             if self.stop_event.is_set():
                 break
-            self.instrument.configure_source(source_mode, float(level), compliance)
+            if is_2636b:
+                self.instrument.set_level_2636(source_mode, float(level))
+            else:
+                self.instrument.configure_source(source_mode, float(level), compliance)
             time.sleep(delay)
             data = self.instrument.measure_once()
             data.update({"index": idx, "setpoint": float(level)})
@@ -1208,7 +1263,12 @@ class App:
         infinite = cfg["infinite"]
         compliance = cfg["compliance"]
 
-        self.instrument.configure_source(source_mode, bias, compliance)
+        is_2636b = self.instrument.model == "2636B"
+        if is_2636b:
+            self.instrument.prepare_source_2636(source_mode, compliance)
+            self.instrument.set_level_2636(source_mode, bias)
+        else:
+            self.instrument.configure_source(source_mode, bias, compliance)
 
         if infinite:
             idx = 0
@@ -2144,7 +2204,7 @@ class App:
         self.iv_points_var.set(iv.get("points", 101))
         self.iv_cycles_var.set(iv.get("cycles", 1))
         self.iv_backforth_var.set(iv.get("back_and_forth", False))
-        self.iv_delay_var.set(iv.get("delay", 0.1))
+        self.iv_delay_var.set(iv.get("delay", 0.0))
         self.iv_compliance_var.set(iv.get("compliance", 0.1))
 
         iv_quality = cfg.get("iv_quality", {})
@@ -2167,28 +2227,28 @@ class App:
 
         it = cfg.get("it", {})
         self.it_bias_var.set(it.get("bias", 0.0))
-        self.it_delay_var.set(it.get("delay", 0.1))
+        self.it_delay_var.set(it.get("delay", 0.0))
         self.it_points_var.set(it.get("points", 50))
         self.it_infinite_var.set(it.get("infinite", False))
         self.it_compliance_var.set(it.get("compliance", 0.1))
 
         vt = cfg.get("vt", {})
         self.vt_bias_var.set(vt.get("bias", 0.0))
-        self.vt_delay_var.set(vt.get("delay", 0.1))
+        self.vt_delay_var.set(vt.get("delay", 0.0))
         self.vt_points_var.set(vt.get("points", 50))
         self.vt_infinite_var.set(vt.get("infinite", False))
         self.vt_compliance_var.set(vt.get("compliance", 10.0))
 
         rt = cfg.get("rt", {})
         self.rt_bias_var.set(rt.get("bias", 0.0))
-        self.rt_delay_var.set(rt.get("delay", 0.1))
+        self.rt_delay_var.set(rt.get("delay", 0.0))
         self.rt_points_var.set(rt.get("points", 50))
         self.rt_infinite_var.set(rt.get("infinite", False))
         self.rt_compliance_var.set(rt.get("compliance", 0.1))
 
         pt = cfg.get("pt", {})
         self.pt_bias_var.set(pt.get("bias", 0.0))
-        self.pt_delay_var.set(pt.get("delay", 0.1))
+        self.pt_delay_var.set(pt.get("delay", 0.0))
         self.pt_points_var.set(pt.get("points", 50))
         self.pt_infinite_var.set(pt.get("infinite", False))
         self.pt_compliance_var.set(pt.get("compliance", 0.1))
