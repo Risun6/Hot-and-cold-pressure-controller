@@ -1001,7 +1001,7 @@ class MultiSequenceApp(ttk.Frame):
 
     def reset_matrix_statuses(self) -> None:
         for key in list(self.cell_labels.keys()):
-        self._apply_cell_state(key, "pending")
+            self._apply_cell_state(key, "pending")
 
     def show_connectivity_checklist(self) -> None:
         checklist = [

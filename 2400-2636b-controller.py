@@ -47,11 +47,17 @@ class KeithleyInstrument:
                 self.rm = None
         self.session = None
         self.simulated = True
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_setpoint = 0.0  # 用于仿真模型中的电压
         self.conn_type = "仿真"    # 连接类型描述（仿真 / RS-232 / GPIB / USB / VISA）
         self.remote_sense = False  # 是否开启四线制（远端感测）
         self.model = None          # 根据 *IDN? 粗略判断机型（"2400" / "2636B"/ 其他）
+        self.forced_model = None   # 用户指定的型号覆盖（None / "2400" / "2636B"）
+        self.channel = "A"        # 2636B 的通道选择（"A" / "B"）
+        self.low_current_speed_mode = False
+        self.current_range_override = None
+        self._low_current_applied = False
+        self.log_callback = None
 
     def list_resources(self):
         if self.rm is None:
@@ -61,7 +67,22 @@ class KeithleyInstrument:
         except Exception:
             return []
 
-    def connect(self, address, simulate=False):
+    def set_forced_model(self, model_str: str | None):
+        if model_str in ("2400", "2636B"):
+            self.forced_model = model_str
+        else:
+            self.forced_model = None
+
+    def set_channel(self, ch: str):
+        if str(ch).upper() == "B":
+            self.channel = "B"
+        else:
+            self.channel = "A"
+
+    def _ch(self) -> str:
+        return "smub" if str(self.channel).upper() == "B" else "smua"
+
+    def connect(self, address, simulate=False, baud_rate: int | None = None):
         """
         address: VISA 资源字符串，例如 'GPIB0::24::INSTR' 或 'ASRL3::INSTR'
         simulate: True 则不连真机，进入仿真模式
@@ -79,6 +100,7 @@ class KeithleyInstrument:
             if simulate or self.rm is None or not address:
                 self.simulated = True
                 self.conn_type = "仿真"
+                self.model = self.forced_model or self.model or "unknown"
                 return "仿真模式（未连接仪器）"
 
             self.simulated = False
@@ -90,7 +112,10 @@ class KeithleyInstrument:
                 if "ASRL" in addr_upper:
                     self.conn_type = "RS-232"
                     try:
-                        self.session.baud_rate = 9600
+                        if baud_rate:
+                            self.session.baud_rate = int(baud_rate)
+                        else:
+                            self.session.baud_rate = 9600
                         self.session.data_bits = 8
                         self.session.stop_bits = 1
                         # 对于 pyvisa，parity 一般用枚举；兜底用 0
@@ -137,6 +162,8 @@ class KeithleyInstrument:
                     model = "2636B"
                 elif "2400" in ident:
                     model = "2400"
+                if self.forced_model in ("2400", "2636B"):
+                    model = self.forced_model
                 self.model = model
 
                 # 对 2636B：使用 TSP reset()/smua.reset()
@@ -146,6 +173,11 @@ class KeithleyInstrument:
                     except Exception:
                         try:
                             self.session.write("smua.reset()")
+                        except Exception:
+                            pass
+                    if self.channel.upper() == "B":
+                        try:
+                            self.session.write("smub.reset()")
                         except Exception:
                             pass
                 else:
@@ -199,17 +231,20 @@ class KeithleyInstrument:
             try:
                 if model == "2636B":
                     # 2636B：使用 TSP / smua 通道
+                    self._apply_low_current_speed_settings_2636()
+                    ch = self._ch()
                     if mode == "Voltage":
-                        self.session.write("smua.source.func = smua.OUTPUT_DCVOLTS")
-                        self.session.write(f"smua.source.levelv = {level_val}")
-                        self.session.write(f"smua.source.limiti = {comp_val}")
+                        self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
+                        self.session.write(f"{ch}.source.levelv = {level_val}")
+                        self.session.write(f"{ch}.source.limiti = {comp_val}")
                     else:
-                        self.session.write("smua.source.func = smua.OUTPUT_DCAMPS")
-                        self.session.write(f"smua.source.leveli = {level_val}")
-                        self.session.write(f"smua.source.limitv = {comp_val}")
-                    self.session.write("smua.source.output = smua.OUTPUT_ON")
+                        self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCAMPS")
+                        self.session.write(f"{ch}.source.leveli = {level_val}")
+                        self.session.write(f"{ch}.source.limitv = {comp_val}")
+                    self.session.write(f"{ch}.source.output = {ch}.OUTPUT_ON")
                 else:
                     # 默认路径：保留原 2400 SCPI 行为
+                    self._apply_low_current_speed_settings_2400()
                     src = "VOLT" if mode == "Voltage" else "CURR"
                     self.session.write(f"SOUR:FUNC {src}")
                     self.session.write(f"SOUR:{src} {level_val}")
@@ -234,13 +269,15 @@ class KeithleyInstrument:
                 return
 
             try:
+                ch = self._ch()
                 if mode == "Voltage":
-                    self.session.write("smua.source.func = smua.OUTPUT_DCVOLTS")
-                    self.session.write(f"smua.source.limiti = {comp_val}")
+                    self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
+                    self.session.write(f"{ch}.source.limiti = {comp_val}")
                 else:
-                    self.session.write("smua.source.func = smua.OUTPUT_DCAMPS")
-                    self.session.write(f"smua.source.limitv = {comp_val}")
-                self.session.write("smua.source.output = smua.OUTPUT_ON")
+                    self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCAMPS")
+                    self.session.write(f"{ch}.source.limitv = {comp_val}")
+                self.session.write(f"{ch}.source.output = {ch}.OUTPUT_ON")
+                self._apply_low_current_speed_settings_2636()
             except Exception:
                 pass
 
@@ -259,9 +296,9 @@ class KeithleyInstrument:
 
             try:
                 if mode == "Voltage":
-                    self.session.write(f"smua.source.levelv = {level_val}")
+                    self.session.write(f"{self._ch()}.source.levelv = {level_val}")
                 else:
-                    self.session.write(f"smua.source.leveli = {level_val}")
+                    self.session.write(f"{self._ch()}.source.leveli = {level_val}")
             except Exception:
                 # 不让底层异常直接炸掉上层流程
                 pass
@@ -277,10 +314,11 @@ class KeithleyInstrument:
             try:
                 if model == "2636B":
                     # 2636B：使用 smua.sense
+                    ch = self._ch()
                     if enable:
-                        self.session.write("smua.sense = smua.SENSE_REMOTE")
+                        self.session.write(f"{ch}.sense = {ch}.SENSE_REMOTE")
                     else:
-                        self.session.write("smua.sense = smua.SENSE_LOCAL")
+                        self.session.write(f"{ch}.sense = {ch}.SENSE_LOCAL")
                 else:
                     # 默认路径：保留原 2400 行为
                     cmd = "ON" if enable else "OFF"
@@ -306,13 +344,74 @@ class KeithleyInstrument:
             try:
                 if model == "2636B":
                     # 2636B：统一用 smua.measure.nplc
-                    self.session.write(f"smua.measure.nplc = {nplc_val}")
+                    self.session.write(f"{self._ch()}.measure.nplc = {nplc_val}")
                 else:
                     # 默认路径：保留原 2400 行为
                     self.session.write(f"SENS:CURR:NPLC {nplc_val}")
                     self.session.write(f"SENS:VOLT:NPLC {nplc_val}")
             except Exception:
                 pass
+
+    def _warn(self, msg: str):
+        try:
+            if callable(self.log_callback):
+                self.log_callback(f"警告: {msg}")
+                return
+        except Exception:
+            pass
+        print(f"[WARN] {msg}")
+
+    def _apply_low_current_speed_settings_2636(self):
+        if self._low_current_applied or not self.low_current_speed_mode:
+            return
+        if self.simulated or self.session is None:
+            return
+        range_val = self.current_range_override
+        try:
+            ch = self._ch()
+            self.session.write(f"{ch}.measure.autorangei = {ch}.AUTORANGE_OFF")
+        except Exception as exc:
+            self._warn(f"关闭电流自动量程失败: {exc}")
+        if range_val:
+            try:
+                self.session.write(f"{self._ch()}.measure.rangei = {float(range_val)}")
+            except Exception as exc:
+                self._warn(f"设置固定电流量程失败: {exc}")
+        try:
+            ch = self._ch()
+            self.session.write(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
+        except Exception as exc:
+            self._warn(f"关闭 AutoZero 失败: {exc}")
+        try:
+            self.session.write(f"{self._ch()}.measure.filter.enable = 0")
+        except Exception as exc:
+            self._warn(f"关闭数字滤波失败: {exc}")
+        self._low_current_applied = True
+
+    def _apply_low_current_speed_settings_2400(self):
+        if self._low_current_applied or not self.low_current_speed_mode:
+            return
+        if self.simulated or self.session is None:
+            return
+        range_val = self.current_range_override
+        try:
+            self.session.write("SENS:CURR:RANG:AUTO OFF")
+        except Exception as exc:
+            self._warn(f"关闭电流自动量程失败: {exc}")
+        if range_val:
+            try:
+                self.session.write(f"SENS:CURR:RANG {float(range_val)}")
+            except Exception as exc:
+                self._warn(f"设置固定电流量程失败: {exc}")
+        try:
+            self.session.write("SYST:AZER OFF")
+        except Exception as exc:
+            self._warn(f"关闭 AutoZero 失败: {exc}")
+        try:
+            self.session.write("SENS:AVER:STAT OFF")
+        except Exception as exc:
+            self._warn(f"关闭平均滤波失败: {exc}")
+        self._low_current_applied = True
 
     def output_off(self):
         with self.lock:
@@ -322,7 +421,7 @@ class KeithleyInstrument:
             model = getattr(self, "model", None)
             try:
                 if model == "2636B":
-                    self.session.write("smua.source.output = smua.OUTPUT_OFF")
+                    self.session.write(f"{self._ch()}.source.output = {self._ch()}.OUTPUT_OFF")
                 else:
                     self.session.write("OUTP OFF")
             except Exception:
@@ -369,7 +468,7 @@ class KeithleyInstrument:
                 if model == "2636B":
                     # 2636B：单条 TSP 命令，直接把 smua.measure.iv() 的两个返回值打印出来
                     # 官方文档：smua.measure.iv() -> [current, voltage]
-                    raw = self.session.query("print(smua.measure.iv())").strip()
+                    raw = self.session.query(f"print({self._ch()}.measure.iv())").strip()
                 else:
                     # 默认路径：沿用 2400 的 READ? + FORM:ELEM VOLT,CURR
                     raw = self.session.query("READ?").strip()
@@ -405,6 +504,162 @@ class KeithleyInstrument:
                 "current": current,
             }
 
+    def buffer_sweep_2636(self, source_mode, compliance, levels, delay):
+        """使用 2636B 内部缓冲区一次性采集多个点。"""
+        with self.lock:
+            if self.simulated or self.session is None:
+                raise RuntimeError("仿真或未连接状态下不支持缓存模式")
+            if not levels:
+                return []
+            try:
+                comp_val = float(compliance)
+            except Exception as exc:
+                raise RuntimeError(f"保护值无效: {exc}") from exc
+
+            ch = self._ch()
+            func = f"{ch}.OUTPUT_DCVOLTS" if source_mode == "Voltage" else f"{ch}.OUTPUT_DCAMPS"
+            level_field = f"{ch}.source.levelv" if source_mode == "Voltage" else f"{ch}.source.leveli"
+            limit_field = f"{ch}.source.limiti" if source_mode == "Voltage" else f"{ch}.source.limitv"
+            try:
+                # 基础配置 + 低电流加速
+                self.session.write(f"{ch}.source.func = {func}")
+                self.session.write(f"{limit_field} = {comp_val}")
+                self.session.write(f"{ch}.source.output = {ch}.OUTPUT_ON")
+                self._apply_low_current_speed_settings_2636()
+            except Exception as exc:
+                raise RuntimeError(f"预配置 2636B 失败: {exc}") from exc
+
+            levels_str = ",".join(str(float(v)) for v in levels)
+            delay_val = max(0.0, float(delay or 0.0))
+            script = """
+local ch = %s
+local lvls = {%s}
+local out = {}
+for i, v in ipairs(lvls) do
+    %s = v
+    local m = ch.measure.iv()
+    out[#out + 1] = string.format("%g,%g", m[2], m[1])
+    if %f > 0 then delay(%f) end
+end
+print(table.concat(out, ";"))
+""" % (ch, levels_str, level_field, delay_val, delay_val)
+            try:
+                raw = self.session.query(script).strip()
+            except Exception as exc:
+                raise RuntimeError(f"执行缓存采集失败: {exc}") from exc
+
+        parts = [p for p in raw.replace(";", ",").split(",") if p]
+        if len(parts) % 2 != 0:
+            raise RuntimeError(f"缓冲返回格式异常: {raw}")
+        base_ts = time.time()
+        readings = []
+        for idx in range(0, len(parts), 2):
+            try:
+                voltage = float(parts[idx])
+                current = float(parts[idx + 1])
+            except Exception as exc:
+                raise RuntimeError(f"解析缓存数据失败: {exc}") from exc
+            readings.append(
+                {
+                    "timestamp": base_ts + delay_val * (idx // 2),
+                    "voltage": voltage,
+                    "current": current,
+                }
+            )
+        return readings
+
+    def buffer_sweep_2400(self, source_mode, compliance, levels, delay):
+        """使用 2400 的内部缓冲区一次性采集多个点。"""
+        with self.lock:
+            if self.simulated or self.session is None:
+                raise RuntimeError("仿真或未连接状态下不支持缓存模式")
+            if not levels:
+                return []
+            try:
+                comp_val = float(compliance)
+            except Exception as exc:
+                raise RuntimeError(f"保护值无效: {exc}") from exc
+
+            delay_val = max(0.0, float(delay or 0.0))
+            unique_levels = set(float(v) for v in levels)
+            try:
+                src = "VOLT" if source_mode == "Voltage" else "CURR"
+                self.session.write(f"SOUR:FUNC {src}")
+                if src == "VOLT":
+                    self.session.write(f"SENS:CURR:PROT {comp_val}")
+                else:
+                    self.session.write(f"SENS:VOLT:PROT {comp_val}")
+                self.session.write("FORM:ELEM VOLT,CURR")
+                self._apply_low_current_speed_settings_2400()
+                self.session.write("TRAC:CLE")
+                self.session.write(f"TRAC:POIN {len(levels)}")
+                self.session.write("TRAC:FEED SENS")
+                self.session.write("TRAC:FEED:CONT NEXT")
+                self.session.write(f"TRIG:COUN {len(levels)}")
+                self.session.write(f"TRIG:DEL {delay_val}")
+            except Exception as exc:
+                raise RuntimeError(f"配置 2400 缓冲失败: {exc}") from exc
+
+            try:
+                if len(unique_levels) == 1:
+                    # 固定电平重复采样
+                    level_val = float(levels[0])
+                    if src == "VOLT":
+                        self.session.write(f"SOUR:VOLT {level_val}")
+                    else:
+                        self.session.write(f"SOUR:CURR {level_val}")
+                    self.session.write("OUTP ON")
+                    self.session.write("INIT")
+                else:
+                    # 线性扫
+                    step = self._infer_linear_step(levels)
+                    self.session.write(f"SOUR:{src}:START {float(levels[0])}")
+                    self.session.write(f"SOUR:{src}:STOP {float(levels[-1])}")
+                    self.session.write(f"SOUR:{src}:STEP {step}")
+                    self.session.write(f"SOUR:{src}:MODE SWE")
+                    self.session.write("OUTP ON")
+                    self.session.write("INIT")
+                raw = self.session.query(f"TRAC:DATA? 1, {len(levels)}, \"defbuffer1\"")
+            except Exception as exc:
+                raise RuntimeError(f"执行 2400 缓存采集失败: {exc}") from exc
+
+        raw_norm = raw.replace(",", " ")
+        parts = [p for p in raw_norm.split() if p]
+        if len(parts) < 2:
+            raise RuntimeError(f"2400 缓冲返回格式异常: {raw}")
+        if len(parts) % 2 != 0:
+            raise RuntimeError(f"2400 缓冲数据不成对: {raw}")
+        base_ts = time.time()
+        readings = []
+        for idx in range(0, len(parts), 2):
+            try:
+                voltage = float(parts[idx])
+                current = float(parts[idx + 1])
+            except Exception as exc:
+                raise RuntimeError(f"解析 2400 缓冲数据失败: {exc}") from exc
+            readings.append(
+                {
+                    "timestamp": base_ts + delay_val * (idx // 2),
+                    "voltage": voltage,
+                    "current": current,
+                }
+            )
+        return readings
+
+    def _infer_linear_step(self, levels):
+        if len(levels) < 2:
+            raise RuntimeError("点数不足，无法推断步长")
+        start = float(levels[0])
+        stop = float(levels[-1])
+        step = (stop - start) / (len(levels) - 1)
+        if step == 0:
+            raise RuntimeError("步长为 0，无法执行线性扫描")
+        for idx, val in enumerate(levels[1:], start=1):
+            expect = start + step * idx
+            if abs(float(val) - expect) > max(1e-9, abs(expect) * 1e-6):
+                raise RuntimeError("点序列不是等步长，无法使用内置扫")
+        return step
+
     def sweep_points(self, start, stop, count):
         return np.linspace(start, stop, max(2, int(count)))
 
@@ -433,12 +688,19 @@ class App:
         self._setup_style()
 
         self.instrument = KeithleyInstrument()
+        self.instrument.log_callback = self._log
         self.queue = queue.Queue()
         self.measurement_thread = None
         self.stop_event = threading.Event()
         self.tcp_stop_event = threading.Event()
         self.tcp_server_thread = None
         self.integration_time_var = tk.DoubleVar(value=0.0)  # 硬件积分时间（NPLC）
+        self.low_current_speed_mode_var = tk.BooleanVar(value=False)
+        self.current_range_override_var = tk.StringVar(value="1e-6")
+        self.model_select_var = tk.StringVar(value="自动识别")
+        self.channel_select_var = tk.StringVar(value="A")
+        self.buffer_mode_var = tk.BooleanVar(value=False)
+        self.baud_rate_var = tk.StringVar(value="9600")
         self._filtered_pressure = None                       # 压力最新值（保留原接口）
         self._filtered_pressure_ts = None                    # 压力更新时间戳
         self.current_mode = None  # "IV", "It", "Vt", "Rt", "Pt"
@@ -446,6 +708,7 @@ class App:
         self.total_points = 0
         self.completed_points = 0
         self.start_time = None
+        self._low_current_range_widgets = []
         self.tcp_waiters = []
         self.tcp_waiters_lock = threading.Lock()
         self.multi_tcp_active = False
@@ -513,6 +776,7 @@ class App:
         ttk.Label(top_lf, text="仪器地址:").grid(row=0, column=0, sticky="w")
         self.resource_combo = ttk.Combobox(top_lf, width=28, state="readonly")
         self.resource_combo.grid(row=0, column=1, sticky="w")
+        self.resource_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_baud_control())
         ttk.Button(top_lf, text="刷新", command=self.refresh_resources).grid(row=0, column=2, sticky="w", padx=(6, 0))
 
         self.sim_var = tk.BooleanVar(value=True)
@@ -533,20 +797,54 @@ class App:
         self.status_label = ttk.Label(top_lf, text="未连接（仿真）")
         self.status_label.grid(row=0, column=6, sticky="w", padx=(6, 0))
 
-        ttk.Label(top_lf, text="保存根文件夹:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        model_frame = ttk.Frame(top_lf)
+        model_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        ttk.Label(model_frame, text="仪器型号:").pack(side=tk.LEFT, padx=(0, 4))
+        self.model_combo = ttk.Combobox(
+            model_frame,
+            width=10,
+            state="readonly",
+            textvariable=self.model_select_var,
+            values=["自动识别", "2400", "2636B"],
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_model_channel_controls())
+
+        self.channel_label = ttk.Label(model_frame, text="2636B 通道:")
+        self.channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.channel_combo = ttk.Combobox(
+            model_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.channel_select_var,
+            values=["A", "B"],
+        )
+        self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(model_frame, text="串口波特率:").pack(side=tk.LEFT, padx=(0, 4))
+        self.baud_combo = ttk.Combobox(
+            model_frame,
+            width=8,
+            state="readonly",
+            values=["9600", "19200", "57600", "115200"],
+            textvariable=self.baud_rate_var,
+        )
+        self.baud_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(top_lf, text="保存根文件夹:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.save_root_var = tk.StringVar()
         self.save_root_entry = ttk.Entry(top_lf, textvariable=self.save_root_var, width=40)
-        self.save_root_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self.save_root_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Button(top_lf, text="浏览...", command=self.choose_save_root).grid(
-            row=1, column=4, sticky="w", padx=(6, 0), pady=(6, 0)
+            row=2, column=4, sticky="w", padx=(6, 0), pady=(6, 0)
         )
         self.auto_save_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top_lf, text="自动保存", variable=self.auto_save_var).grid(
-            row=1, column=5, sticky="w", padx=(6, 0), pady=(6, 0)
+            row=2, column=5, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
         interval_frame = ttk.Frame(top_lf)
-        interval_frame.grid(row=2, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        interval_frame.grid(row=3, column=0, columnspan=7, sticky="w", pady=(6, 0))
         ttk.Label(interval_frame, text="积分时间(NPLC):").pack(side=tk.LEFT, padx=5, pady=2)
         self.integration_time_entry = ttk.Entry(
             interval_frame,
@@ -666,7 +964,58 @@ class App:
             row=0, column=4, sticky="w", padx=(4, 0)
         )
 
+        self._sync_model_channel_controls()
+        self._sync_baud_control()
+
     # ---- 各模式参数区 ----
+
+    def _add_buffer_mode_control(self, parent, row):
+        chk = ttk.Checkbutton(
+            parent,
+            text="缓存模式（仪器内部批量采集，更快）",
+            variable=self.buffer_mode_var,
+        )
+        chk.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        return row + 1
+
+    def _add_low_current_controls(self, parent, row):
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            frame,
+            text="低电流加速模式（更快/更噪）",
+            variable=self.low_current_speed_mode_var,
+            command=self._sync_low_current_controls,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            frame,
+            text="启用后会关闭/限制自动量程、AutoZero/平均滤波，并偏向更小 NPLC，\n可能降低稳定性/精度。",
+            foreground="#666",
+            wraplength=320,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        range_frame = ttk.Frame(parent)
+        range_frame.grid(row=row + 1, column=0, columnspan=4, sticky="w")
+        lbl = ttk.Label(range_frame, text="电流量程(A):")
+        lbl.grid(row=0, column=0, sticky="e", pady=4, padx=(0, 4))
+        entry = ttk.Entry(range_frame, textvariable=self.current_range_override_var, width=14)
+        entry.grid(row=0, column=1, sticky="w", pady=4)
+        self._low_current_range_widgets.append((range_frame, lbl, entry))
+        self._sync_low_current_controls()
+        return row + 2
+
+    def _sync_low_current_controls(self):
+        visible = bool(self.low_current_speed_mode_var.get())
+        for frame, lbl, entry in self._low_current_range_widgets:
+            if visible:
+                frame.grid()
+                lbl.grid()
+                entry.grid()
+            else:
+                frame.grid_remove()
+                lbl.grid_remove()
+                entry.grid_remove()
 
     def _build_iv_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
@@ -686,6 +1035,7 @@ class App:
         self.iv_points_var = tk.IntVar(value=101)
         self.iv_cycles_var = tk.IntVar(value=1)
         self.iv_backforth_var = tk.BooleanVar(value=False)
+        self.iv_triangle_from_zero_var = tk.BooleanVar(value=False)
         self.iv_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
@@ -696,6 +1046,7 @@ class App:
         self._iv_updating = False
 
         row = 0
+        row = self._add_buffer_mode_control(inner, row)
         ttk.Label(inner, text="源模式:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         mode_combo = ttk.Combobox(
             inner,
@@ -737,6 +1088,20 @@ class App:
         ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 2))
         row += 1
 
+        self.iv_triangle_from_zero_chk = ttk.Checkbutton(
+            inner,
+            text="三角扫描从原点开始（0-终点-起点-0）",
+            variable=self.iv_triangle_from_zero_var,
+            command=self._on_triangle_from_zero_toggle,
+        )
+        self.iv_triangle_from_zero_chk.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        row += 1
+
+        self.iv_backforth_var.trace_add("write", lambda *args: self._sync_triangle_from_zero_state())
+        self._sync_triangle_from_zero_state()
+
+        row = self._add_low_current_controls(inner, row)
+
         ttk.Checkbutton(
             frame,
             text="启用 IV 质量检测",
@@ -775,6 +1140,23 @@ class App:
             self.iv_quality_frame.grid()
         else:
             self.iv_quality_frame.grid_remove()
+
+    def _on_triangle_from_zero_toggle(self):
+        if self.iv_triangle_from_zero_var.get() and not self.iv_backforth_var.get():
+            self.iv_backforth_var.set(True)
+        self._sync_triangle_from_zero_state()
+
+    def _sync_triangle_from_zero_state(self):
+        enable = bool(self.iv_backforth_var.get())
+        if not enable:
+            self.iv_triangle_from_zero_var.set(False)
+        try:
+            if enable:
+                self.iv_triangle_from_zero_chk.state(["!disabled"])
+            else:
+                self.iv_triangle_from_zero_chk.state(["disabled"])
+        except Exception:
+            pass
 
     def _update_points_from_step(self):
         if self._iv_updating:
@@ -832,6 +1214,7 @@ class App:
         self.it_compliance_var = tk.DoubleVar(value=0.1)
 
         row = 0
+        row = self._add_buffer_mode_control(inner, row)
         ttk.Label(inner, text="电压偏置:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_bias_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
@@ -843,6 +1226,8 @@ class App:
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
+
+        row = self._add_low_current_controls(inner, row)
 
         ttk.Checkbutton(
             inner,
@@ -869,6 +1254,7 @@ class App:
         self.vt_compliance_var = tk.DoubleVar(value=10.0)
 
         row = 0
+        row = self._add_buffer_mode_control(inner, row)
         ttk.Label(inner, text="电流偏置:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_bias_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
@@ -880,6 +1266,8 @@ class App:
         ttk.Label(inner, text="保护电压(V):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
+
+        row = self._add_low_current_controls(inner, row)
 
         ttk.Checkbutton(
             inner,
@@ -906,6 +1294,7 @@ class App:
         self.rt_compliance_var = tk.DoubleVar(value=0.1)
 
         row = 0
+        row = self._add_buffer_mode_control(inner, row)
         ttk.Label(inner, text="电压偏置:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_bias_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
@@ -917,6 +1306,8 @@ class App:
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
+
+        row = self._add_low_current_controls(inner, row)
 
         ttk.Checkbutton(
             inner,
@@ -943,6 +1334,7 @@ class App:
         self.pt_compliance_var = tk.DoubleVar(value=0.1)
 
         row = 0
+        row = self._add_buffer_mode_control(inner, row)
         ttk.Label(inner, text="电压偏置:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_bias_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
@@ -954,6 +1346,8 @@ class App:
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
+
+        row = self._add_low_current_controls(inner, row)
 
         ttk.Checkbutton(
             inner,
@@ -1053,12 +1447,41 @@ class App:
             self.ofr_sim_start_btn.grid_remove()
             self.ofr_sim_stop_btn.grid_remove()
 
+    def _sync_model_channel_controls(self):
+        model = self.model_select_var.get()
+        if model == "2636B":
+            try:
+                self.channel_label.pack(side=tk.LEFT, padx=(0, 4))
+                self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+            except Exception:
+                pass
+        else:
+            try:
+                self.channel_label.pack_forget()
+                self.channel_combo.pack_forget()
+            except Exception:
+                pass
+
+    def _sync_baud_control(self):
+        addr = (self.resource_combo.get() or "").upper()
+        if "ASRL" in addr:
+            try:
+                self.baud_combo.config(state="readonly")
+            except Exception:
+                pass
+        else:
+            try:
+                self.baud_combo.config(state="disabled")
+            except Exception:
+                pass
+
     def refresh_resources(self):
         resources = self.instrument.list_resources()
         self.resource_combo["values"] = resources
         if resources:
             self.resource_combo.current(0)
             self._log(f"找到地址: {resources}")
+            self._sync_baud_control()
         else:
             self._log("未找到任何 VISA 资源")
 
@@ -1086,6 +1509,10 @@ class App:
         self.status_label.config(text=f"{status} | 四线: {sense_str}")
 
     def connect_instrument(self):
+        selected_model = self.model_select_var.get()
+        forced_model = selected_model if selected_model in ("2400", "2636B") else None
+        self.instrument.set_forced_model(forced_model)
+        self.instrument.set_channel(self.channel_select_var.get())
         simulate = self.sim_var.get()
         if simulate:
             status = self.instrument.connect(address=None, simulate=True)
@@ -1094,7 +1521,13 @@ class App:
             if not addr:
                 messagebox.showwarning("未选择地址", "请先在下拉框中选择一个仪器地址，或勾选仿真模式。")
                 return
-            status = self.instrument.connect(address=addr, simulate=False)
+            baud = None
+            if "ASRL" in addr.upper():
+                try:
+                    baud = int(self.baud_rate_var.get())
+                except Exception:
+                    baud = None
+            status = self.instrument.connect(address=addr, simulate=False, baud_rate=baud)
 
         # 连接成功后，根据当前勾选状态设置四线
         enable = bool(getattr(self, "four_wire_var", tk.BooleanVar(value=False)).get())
@@ -1156,13 +1589,18 @@ class App:
             return False
 
         model = getattr(self.instrument, "model", None)
+        low_current_mode = bool(config.get("low_current_speed_mode", False))
+        self.instrument.low_current_speed_mode = low_current_mode
+        self.instrument.current_range_override = config.get("current_range_override")
+        self.instrument._low_current_applied = False
         try:
             nplc = float(self.integration_time_var.get())
         except Exception:
             nplc = 0.0
 
+        model_upper = (model or "").upper()
         if nplc <= 0:
-            nplc = 0.01 if model == "2636B" else 0.1
+            nplc = 0.01 if low_current_mode else (0.01 if model_upper == "2636B" else 0.1)
 
         try:
             self.instrument.set_nplc(nplc)
@@ -1223,26 +1661,50 @@ class App:
         points = cfg["points"]
         cycles = cfg["cycles"]
         back_and_forth = cfg["back_and_forth"]
+        triangle_from_zero = cfg.get("triangle_from_zero", False)
         delay = cfg["delay"]
         compliance = cfg["compliance"]
         source_mode = cfg["source_mode"]
+        buffer_mode = bool(cfg.get("buffer_mode", False))
+        levels_from_cfg = cfg.get("levels") if buffer_mode else None
 
-        base_forward = self.instrument.sweep_points(start, stop, points)
-        if back_and_forth:
-            if len(base_forward) > 1:
-                backward = base_forward[-2::-1]
-            else:
-                backward = base_forward
-            one_cycle = np.concatenate([base_forward, backward])
+        if buffer_mode and isinstance(levels_from_cfg, (list, tuple)):
+            seq = list(levels_from_cfg)
         else:
-            one_cycle = base_forward
-
-        seq = np.tile(one_cycle, cycles)
-        is_2636b = self.instrument.model == "2636B"
+            base_forward = self.instrument.sweep_points(start, stop, points)
+            if triangle_from_zero:
+                seg1 = self.instrument.sweep_points(0, stop, points)
+                seg2 = self.instrument.sweep_points(stop, start, points)[1:]
+                seg3 = self.instrument.sweep_points(start, 0, points)[1:]
+                one_cycle = np.concatenate([seg1, seg2, seg3])
+            elif back_and_forth:
+                if len(base_forward) > 1:
+                    backward = base_forward[-2::-1]
+                else:
+                    backward = base_forward
+                one_cycle = np.concatenate([base_forward, backward])
+            else:
+                one_cycle = base_forward
+            seq = np.tile(one_cycle, cycles)
+        is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
         if is_2636b:
             self.instrument.prepare_source_2636(source_mode, compliance)
         else:
             self.instrument.configure_source(source_mode, float(seq[0]), compliance)
+
+        if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
+            try:
+                if is_2636b:
+                    readings = self.instrument.buffer_sweep_2636(source_mode, compliance, seq, delay)
+                else:
+                    readings = self.instrument.buffer_sweep_2400(source_mode, compliance, seq, delay)
+                for idx, data in enumerate(readings):
+                    sp = float(seq[idx]) if idx < len(seq) else 0.0
+                    data.update({"index": idx, "setpoint": sp})
+                    self.queue.put(("data", data, self.total_points))
+                return
+            except Exception as exc:
+                self._log(f"缓存模式失败，回退到逐点: {exc}")
 
         for idx, level in enumerate(seq):
             if self.stop_event.is_set():
@@ -1251,7 +1713,8 @@ class App:
                 self.instrument.set_level_2636(source_mode, float(level))
             else:
                 self.instrument.configure_source(source_mode, float(level), compliance)
-            time.sleep(delay)
+            if delay and delay > 0:
+                time.sleep(delay)
             data = self.instrument.measure_once()
             data.update({"index": idx, "setpoint": float(level)})
             self.queue.put(("data", data, self.total_points))
@@ -1263,8 +1726,9 @@ class App:
         points = cfg["points"]
         infinite = cfg["infinite"]
         compliance = cfg["compliance"]
+        buffer_mode = bool(cfg.get("buffer_mode", False))
 
-        is_2636b = self.instrument.model == "2636B"
+        is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
         if is_2636b:
             self.instrument.prepare_source_2636(source_mode, compliance)
             self.instrument.set_level_2636(source_mode, bias)
@@ -1278,17 +1742,91 @@ class App:
                 data.update({"index": idx, "setpoint": bias})
                 self.queue.put(("data", data, 0))
                 idx += 1
-                time.sleep(delay)
+                if delay and delay > 0:
+                    time.sleep(delay)
         else:
+            seq = [bias] * max(0, points)
+            if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
+                try:
+                    if is_2636b:
+                        readings = self.instrument.buffer_sweep_2636(source_mode, compliance, seq, delay)
+                    else:
+                        readings = self.instrument.buffer_sweep_2400(source_mode, compliance, seq, delay)
+                    for idx, data in enumerate(readings):
+                        data.update({"index": idx, "setpoint": bias})
+                        self.queue.put(("data", data, self.total_points))
+                    return
+                except Exception as exc:
+                    self._log(f"缓存模式失败，回退到逐点: {exc}")
+
             for idx in range(points):
                 if self.stop_event.is_set():
                     break
                 data = self.instrument.measure_once()
                 data.update({"index": idx, "setpoint": bias})
                 self.queue.put(("data", data, self.total_points))
-                time.sleep(delay)
+                if delay and delay > 0:
+                    time.sleep(delay)
 
     # ---- 参数收集 ----
+
+    def _get_current_range_override_value(self):
+        raw = (self.current_range_override_var.get() or "").strip()
+        if not raw:
+            return 1e-6
+        try:
+            val = float(raw)
+            if val <= 0:
+                raise ValueError("range must be positive")
+            return val
+        except Exception:
+            self._log("电流量程输入无效，已回退到 1e-6 A")
+            self.current_range_override_var.set("1e-6")
+            return 1e-6
+
+    def _build_iv_levels(self, start, stop, step, points, cycles, back_and_forth, triangle_from_zero=False):
+        try:
+            step_val = float(step)
+        except Exception:
+            step_val = 0.0
+        if step_val == 0:
+            self._log("步长为 0，已回退到点数线性生成")
+            base = list(self.instrument.sweep_points(start, stop, 2))
+        else:
+            direction = 1 if stop >= start else -1
+            actual_step = abs(step_val) * direction
+            base = []
+            val = float(start)
+            guard = 0
+            while (
+                (direction > 0 and val <= stop + 1e-12)
+                or (direction < 0 and val >= stop - 1e-12)
+            ):
+                base.append(val)
+                val += actual_step
+                guard += 1
+                if guard > 200000:
+                    self._log("步长设置导致点数过多，已提前截断")
+                    break
+            if len(base) < 2:
+                base = [start, stop]
+
+        if triangle_from_zero:
+            seg1 = list(self.instrument.sweep_points(0, stop, points))
+            seg2 = list(self.instrument.sweep_points(stop, start, points))[1:]
+            seg3 = list(self.instrument.sweep_points(start, 0, points))[1:]
+            segment = list(np.concatenate([seg1, seg2, seg3]))
+        elif back_and_forth:
+            if len(base) > 1:
+                segment = base + base[-2::-1]
+            else:
+                segment = base
+        else:
+            segment = base
+        seq = []
+        for _ in range(max(1, int(cycles))):
+            seq.extend(segment)
+        return seq
 
     def _collect_iv_config(self):
         try:
@@ -1318,14 +1856,37 @@ class App:
         if points < 2:
             messagebox.showwarning("输入错误", "点数至少为 2")
             return None
-        if self.iv_backforth_var.get():
+        if self.iv_triangle_from_zero_var.get():
+            per_cycle = points * 3 - 2 if points > 1 else points
+        elif self.iv_backforth_var.get():
             if points > 1:
                 per_cycle = points * 2 - 1
             else:
                 per_cycle = points
         else:
             per_cycle = points
-        total_points = max(0, per_cycle * max(1, cycles))
+        buffer_mode = bool(self.buffer_mode_var.get())
+        triangle_from_zero = self.iv_triangle_from_zero_var.get()
+        levels = None
+        if buffer_mode:
+            levels = self._build_iv_levels(
+                start,
+                stop,
+                step,
+                points,
+                cycles,
+                self.iv_backforth_var.get(),
+                triangle_from_zero,
+            )
+            total_points = len(levels)
+        else:
+            total_points = max(0, per_cycle * max(1, cycles))
+            try:
+                expected_step = (stop - start) / (points - 1)
+                if points > 1 and abs(step - expected_step) > max(1e-9, abs(expected_step) * 0.01):
+                    self._log("提示: 步长仅在缓存模式/内置 sweep 时生效，当前按点数生成扫描。")
+            except Exception:
+                pass
         return dict(
             start=start,
             stop=stop,
@@ -1333,10 +1894,15 @@ class App:
             points=points,
             cycles=cycles,
             back_and_forth=self.iv_backforth_var.get(),
+            triangle_from_zero=triangle_from_zero,
             delay=delay,
             compliance=compliance,
             source_mode="Voltage" if source_mode == "Voltage" else "Current",
             total_points=total_points,
+            low_current_speed_mode=self.low_current_speed_mode_var.get(),
+            current_range_override=self._get_current_range_override_value(),
+            buffer_mode=buffer_mode,
+            levels=levels if buffer_mode else None,
         )
 
     def _collect_it_config(self):
@@ -1358,6 +1924,10 @@ class App:
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
+        buffer_mode = bool(self.buffer_mode_var.get())
+        if infinite and buffer_mode:
+            self._log("提示: 不限时模式下无法启用缓存模式，已回退逐点采集。")
+            buffer_mode = False
         total_points = 0 if infinite else max(0, points)
         return dict(
             bias=bias,
@@ -1366,6 +1936,9 @@ class App:
             infinite=infinite,
             compliance=compliance,
             total_points=total_points,
+            low_current_speed_mode=self.low_current_speed_mode_var.get(),
+            current_range_override=self._get_current_range_override_value(),
+            buffer_mode=buffer_mode,
         )
 
     def _collect_vt_config(self):
@@ -1387,6 +1960,10 @@ class App:
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
+        buffer_mode = bool(self.buffer_mode_var.get())
+        if infinite and buffer_mode:
+            self._log("提示: 不限时模式下无法启用缓存模式，已回退逐点采集。")
+            buffer_mode = False
         total_points = 0 if infinite else max(0, points)
         return dict(
             bias=bias,
@@ -1395,6 +1972,9 @@ class App:
             infinite=infinite,
             compliance=compliance,
             total_points=total_points,
+            low_current_speed_mode=self.low_current_speed_mode_var.get(),
+            current_range_override=self._get_current_range_override_value(),
+            buffer_mode=buffer_mode,
         )
 
     def _collect_rt_config(self):
@@ -1416,6 +1996,10 @@ class App:
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
+        buffer_mode = bool(self.buffer_mode_var.get())
+        if infinite and buffer_mode:
+            self._log("提示: 不限时模式下无法启用缓存模式，已回退逐点采集。")
+            buffer_mode = False
         total_points = 0 if infinite else max(0, points)
         return dict(
             bias=bias,
@@ -1425,6 +2009,9 @@ class App:
             compliance=compliance,
             total_points=total_points,
             source_mode="Voltage",
+            low_current_speed_mode=self.low_current_speed_mode_var.get(),
+            current_range_override=self._get_current_range_override_value(),
+            buffer_mode=buffer_mode,
         )
 
     def _collect_pt_config(self):
@@ -1446,6 +2033,10 @@ class App:
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
+        buffer_mode = bool(self.buffer_mode_var.get())
+        if infinite and buffer_mode:
+            self._log("提示: 不限时模式下无法启用缓存模式，已回退逐点采集。")
+            buffer_mode = False
         total_points = 0 if infinite else max(0, points)
         return dict(
             bias=bias,
@@ -1455,6 +2046,9 @@ class App:
             compliance=compliance,
             total_points=total_points,
             source_mode="Voltage",
+            low_current_speed_mode=self.low_current_speed_mode_var.get(),
+            current_range_override=self._get_current_range_override_value(),
+            buffer_mode=buffer_mode,
         )
 
     # ---- 队列 & 进度 ----
@@ -2105,6 +2699,12 @@ class App:
             "integration_nplc": float(self.integration_time_var.get())
             if hasattr(self, "integration_time_var")
             else 0.0,
+            "low_current_speed_mode": self.low_current_speed_mode_var.get(),
+            "current_range_override": self._get_current_range_override_value(),
+            "model_select": self.model_select_var.get(),
+            "channel_select": self.channel_select_var.get(),
+            "buffer_mode": self.buffer_mode_var.get(),
+            "baud_rate": self.baud_rate_var.get(),
             "iv": {
                 "source_mode": self.iv_source_mode_var.get(),
                 "start": self.iv_start_var.get(),
@@ -2113,6 +2713,7 @@ class App:
                 "points": self.iv_points_var.get(),
                 "cycles": self.iv_cycles_var.get(),
                 "back_and_forth": self.iv_backforth_var.get(),
+                "triangle_from_zero": self.iv_triangle_from_zero_var.get(),
                 "delay": self.iv_delay_var.get(),
                 "compliance": self.iv_compliance_var.get(),
             },
@@ -2177,6 +2778,10 @@ class App:
             return
         self.save_root_var.set(cfg.get("save_root", ""))
         self.auto_save_var.set(cfg.get("auto_save", False))
+        self.model_select_var.set(cfg.get("model_select", "自动识别"))
+        self.channel_select_var.set(cfg.get("channel_select", "A"))
+        self.buffer_mode_var.set(cfg.get("buffer_mode", False))
+        self.baud_rate_var.set(str(cfg.get("baud_rate", "9600")))
 
         if hasattr(self, "integration_time_var"):
             try:
@@ -2186,6 +2791,18 @@ class App:
             if tau < 0:
                 tau = 0.0
             self.integration_time_var.set(tau)
+
+        self.low_current_speed_mode_var.set(cfg.get("low_current_speed_mode", False))
+        self.current_range_override_var.set(str(cfg.get("current_range_override", "1e-6")))
+        try:
+            self._sync_low_current_controls()
+        except Exception:
+            pass
+        try:
+            self._sync_model_channel_controls()
+            self._sync_baud_control()
+        except Exception:
+            pass
 
         # 读取四线制与曲线样式
         if hasattr(self, "four_wire_var"):
@@ -2205,6 +2822,7 @@ class App:
         self.iv_points_var.set(iv.get("points", 101))
         self.iv_cycles_var.set(iv.get("cycles", 1))
         self.iv_backforth_var.set(iv.get("back_and_forth", False))
+        self.iv_triangle_from_zero_var.set(iv.get("triangle_from_zero", False))
         self.iv_delay_var.set(iv.get("delay", 0.0))
         self.iv_compliance_var.set(iv.get("compliance", 0.1))
 
