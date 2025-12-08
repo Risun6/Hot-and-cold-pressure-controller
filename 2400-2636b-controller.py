@@ -53,10 +53,13 @@ class KeithleyInstrument:
         self.remote_sense = False  # 是否开启四线制（远端感测）
         self.model = None          # 根据 *IDN? 粗略判断机型（"2400" / "2636B"/ 其他）
         self.forced_model = None   # 用户指定的型号覆盖（None / "2400" / "2636B"）
-        self.channel = "A"        # 2636B 的通道选择（"A" / "B"）
+        self.channel = "A"        # 兼容旧字段，等同于 source_channel
+        self.source_channel = "A"
+        self.measure_channel = "A"
         self.low_current_speed_mode = False
         self.current_range_override = None
         self._low_current_applied = False
+        self._low_current_snapshot = {}
         self.log_callback = None
 
     def list_resources(self):
@@ -74,13 +77,31 @@ class KeithleyInstrument:
             self.forced_model = None
 
     def set_channel(self, ch: str):
+        self.set_source_channel(ch)
+        self.set_measure_channel(ch)
+
+    def set_source_channel(self, ch: str):
         if str(ch).upper() == "B":
-            self.channel = "B"
+            self.source_channel = "B"
         else:
-            self.channel = "A"
+            self.source_channel = "A"
+        self.channel = self.source_channel
+
+    def set_measure_channel(self, ch: str):
+        if str(ch).upper() == "B":
+            self.measure_channel = "B"
+        else:
+            self.measure_channel = "A"
+
+    def _source_ch(self) -> str:
+        return "smub" if str(self.source_channel).upper() == "B" else "smua"
+
+    def _measure_ch(self) -> str:
+        return "smub" if str(self.measure_channel).upper() == "B" else "smua"
 
     def _ch(self) -> str:
-        return "smub" if str(self.channel).upper() == "B" else "smua"
+        # 默认仍返回源通道，保持旧接口兼容
+        return self._source_ch()
 
     def connect(self, address, simulate=False, baud_rate: int | None = None):
         """
@@ -175,7 +196,7 @@ class KeithleyInstrument:
                             self.session.write("smua.reset()")
                         except Exception:
                             pass
-                    if self.channel.upper() == "B":
+                    if "B" in {self.source_channel.upper(), self.measure_channel.upper()}:
                         try:
                             self.session.write("smub.reset()")
                         except Exception:
@@ -232,7 +253,7 @@ class KeithleyInstrument:
                 if model == "2636B":
                     # 2636B：使用 TSP / smua 通道
                     self._apply_low_current_speed_settings_2636()
-                    ch = self._ch()
+                    ch = self._source_ch()
                     if mode == "Voltage":
                         self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
                         self.session.write(f"{ch}.source.levelv = {level_val}")
@@ -269,7 +290,7 @@ class KeithleyInstrument:
                 return
 
             try:
-                ch = self._ch()
+                ch = self._source_ch()
                 if mode == "Voltage":
                     self.session.write(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
                     self.session.write(f"{ch}.source.limiti = {comp_val}")
@@ -296,9 +317,9 @@ class KeithleyInstrument:
 
             try:
                 if mode == "Voltage":
-                    self.session.write(f"{self._ch()}.source.levelv = {level_val}")
+                    self.session.write(f"{self._source_ch()}.source.levelv = {level_val}")
                 else:
-                    self.session.write(f"{self._ch()}.source.leveli = {level_val}")
+                    self.session.write(f"{self._source_ch()}.source.leveli = {level_val}")
             except Exception:
                 # 不让底层异常直接炸掉上层流程
                 pass
@@ -314,7 +335,7 @@ class KeithleyInstrument:
             try:
                 if model == "2636B":
                     # 2636B：使用 smua.sense
-                    ch = self._ch()
+                    ch = self._measure_ch()
                     if enable:
                         self.session.write(f"{ch}.sense = {ch}.SENSE_REMOTE")
                     else:
@@ -344,7 +365,7 @@ class KeithleyInstrument:
             try:
                 if model == "2636B":
                     # 2636B：统一用 smua.measure.nplc
-                    self.session.write(f"{self._ch()}.measure.nplc = {nplc_val}")
+                    self.session.write(f"{self._measure_ch()}.measure.nplc = {nplc_val}")
                 else:
                     # 默认路径：保留原 2400 行为
                     self.session.write(f"SENS:CURR:NPLC {nplc_val}")
@@ -361,29 +382,139 @@ class KeithleyInstrument:
             pass
         print(f"[WARN] {msg}")
 
+    def set_low_current_mode(self, enable: bool):
+        """切换低电流模式，负责快照采集/恢复。"""
+        if enable:
+            self.low_current_speed_mode = True
+            self._low_current_applied = False
+            self._low_current_snapshot = {}
+            return
+
+        # 关闭低电流模式，尝试恢复快照
+        if self.low_current_speed_mode and self._low_current_applied:
+            try:
+                self._restore_low_current_snapshot()
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"恢复低电流前快照失败: {exc}")
+        self.low_current_speed_mode = False
+        self._low_current_applied = False
+        self._low_current_snapshot = {}
+
+    def _capture_low_current_snapshot_2636(self):
+        if self._low_current_snapshot or self.simulated or self.session is None:
+            return
+        ch = self._measure_ch()
+        snapshot = {}
+        queries = {
+            "autorangei": f"print({ch}.measure.autorangei)",
+            "rangei": f"print({ch}.measure.rangei)",
+            "autozero": f"print({ch}.measure.autozero)",
+            "filter": f"print({ch}.measure.filter.enable)",
+            "nplc": f"print({ch}.measure.nplc)",
+            "sense": f"print({ch}.sense)",
+        }
+        for key, cmd in queries.items():
+            try:
+                snapshot[key] = self.session.query(cmd).strip()
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"读取 {key} 快照失败: {exc}")
+        self._low_current_snapshot = snapshot
+
+    def _capture_low_current_snapshot_2400(self):
+        if self._low_current_snapshot or self.simulated or self.session is None:
+            return
+        snapshot = {}
+        queries = {
+            "autorange": "SENS:CURR:RANG:AUTO?",
+            "range": "SENS:CURR:RANG?",
+            "autozero": "SYST:AZER?",
+            "filter": "SENS:AVER:STAT?",
+            "sense_func": "SENS:FUNC?",
+            "nplc_curr": "SENS:CURR:NPLC?",
+            "nplc_volt": "SENS:VOLT:NPLC?",
+        }
+        for key, cmd in queries.items():
+            try:
+                snapshot[key] = self.session.query(cmd).strip()
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"读取 {key} 快照失败: {exc}")
+        self._low_current_snapshot = snapshot
+
+    def _restore_low_current_snapshot(self):
+        if not self._low_current_snapshot or self.simulated or self.session is None:
+            return
+        model = getattr(self, "model", None)
+        if model == "2636B":
+            self._restore_low_current_snapshot_2636()
+        else:
+            self._restore_low_current_snapshot_2400()
+
+    def _restore_low_current_snapshot_2636(self):
+        ch = self._measure_ch()
+        snap = self._low_current_snapshot
+        if not snap:
+            return
+        restorers = {
+            "autorangei": lambda v: self.session.write(f"{ch}.measure.autorangei = {v}"),
+            "rangei": lambda v: self.session.write(f"{ch}.measure.rangei = {float(v)}"),
+            "autozero": lambda v: self.session.write(f"{ch}.measure.autozero = {v}"),
+            "filter": lambda v: self.session.write(f"{ch}.measure.filter.enable = {v}"),
+            "nplc": lambda v: self.session.write(f"{ch}.measure.nplc = {float(v)}"),
+            "sense": lambda v: self.session.write(f"{ch}.sense = {v}"),
+        }
+        for key, action in restorers.items():
+            if key not in snap:
+                continue
+            try:
+                action(snap[key])
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"恢复 {key} 失败: {exc}")
+
+    def _restore_low_current_snapshot_2400(self):
+        snap = self._low_current_snapshot
+        if not snap:
+            return
+        restorers = {
+            "autorange": lambda v: self.session.write(f"SENS:CURR:RANG:AUTO {v}"),
+            "range": lambda v: self.session.write(f"SENS:CURR:RANG {float(v)}"),
+            "autozero": lambda v: self.session.write(f"SYST:AZER {v}"),
+            "filter": lambda v: self.session.write(f"SENS:AVER:STAT {v}"),
+            "sense_func": lambda v: self.session.write(f"SENS:FUNC {v}"),
+            "nplc_curr": lambda v: self.session.write(f"SENS:CURR:NPLC {float(v)}"),
+            "nplc_volt": lambda v: self.session.write(f"SENS:VOLT:NPLC {float(v)}"),
+        }
+        for key, action in restorers.items():
+            if key not in snap:
+                continue
+            try:
+                action(snap[key])
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"恢复 {key} 失败: {exc}")
+
     def _apply_low_current_speed_settings_2636(self):
         if self._low_current_applied or not self.low_current_speed_mode:
             return
         if self.simulated or self.session is None:
             return
+        self._capture_low_current_snapshot_2636()
         range_val = self.current_range_override
         try:
-            ch = self._ch()
+            ch = self._measure_ch()
             self.session.write(f"{ch}.measure.autorangei = {ch}.AUTORANGE_OFF")
         except Exception as exc:
             self._warn(f"关闭电流自动量程失败: {exc}")
         if range_val:
             try:
-                self.session.write(f"{self._ch()}.measure.rangei = {float(range_val)}")
+                self.session.write(f"{self._measure_ch()}.measure.rangei = {float(range_val)}")
             except Exception as exc:
                 self._warn(f"设置固定电流量程失败: {exc}")
         try:
-            ch = self._ch()
+            ch = self._measure_ch()
             self.session.write(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
         except Exception as exc:
             self._warn(f"关闭 AutoZero 失败: {exc}")
         try:
-            self.session.write(f"{self._ch()}.measure.filter.enable = 0")
+            self.session.write(f"{self._measure_ch()}.measure.filter.enable = 0")
         except Exception as exc:
             self._warn(f"关闭数字滤波失败: {exc}")
         self._low_current_applied = True
@@ -393,6 +524,7 @@ class KeithleyInstrument:
             return
         if self.simulated or self.session is None:
             return
+        self._capture_low_current_snapshot_2400()
         range_val = self.current_range_override
         try:
             self.session.write("SENS:CURR:RANG:AUTO OFF")
@@ -421,7 +553,14 @@ class KeithleyInstrument:
             model = getattr(self, "model", None)
             try:
                 if model == "2636B":
-                    self.session.write(f"{self._ch()}.source.output = {self._ch()}.OUTPUT_OFF")
+                    src = self._source_ch()
+                    self.session.write(f"{src}.source.output = {src}.OUTPUT_OFF")
+                    meas = self._measure_ch()
+                    if meas != src:
+                        try:
+                            self.session.write(f"{meas}.source.output = {meas}.OUTPUT_OFF")
+                        except Exception:
+                            pass
                 else:
                     self.session.write("OUTP OFF")
             except Exception:
@@ -468,7 +607,7 @@ class KeithleyInstrument:
                 if model == "2636B":
                     # 2636B：单条 TSP 命令，直接把 smua.measure.iv() 的两个返回值打印出来
                     # 官方文档：smua.measure.iv() -> [current, voltage]
-                    raw = self.session.query(f"print({self._ch()}.measure.iv())").strip()
+                    raw = self.session.query(f"print({self._measure_ch()}.measure.iv())").strip()
                 else:
                     # 默认路径：沿用 2400 的 READ? + FORM:ELEM VOLT,CURR
                     raw = self.session.query("READ?").strip()
@@ -516,15 +655,16 @@ class KeithleyInstrument:
             except Exception as exc:
                 raise RuntimeError(f"保护值无效: {exc}") from exc
 
-            ch = self._ch()
-            func = f"{ch}.OUTPUT_DCVOLTS" if source_mode == "Voltage" else f"{ch}.OUTPUT_DCAMPS"
-            level_field = f"{ch}.source.levelv" if source_mode == "Voltage" else f"{ch}.source.leveli"
-            limit_field = f"{ch}.source.limiti" if source_mode == "Voltage" else f"{ch}.source.limitv"
+            src_ch = self._source_ch()
+            meas_ch = self._measure_ch()
+            func = f"{src_ch}.OUTPUT_DCVOLTS" if source_mode == "Voltage" else f"{src_ch}.OUTPUT_DCAMPS"
+            level_field = f"{src_ch}.source.levelv" if source_mode == "Voltage" else f"{src_ch}.source.leveli"
+            limit_field = f"{src_ch}.source.limiti" if source_mode == "Voltage" else f"{src_ch}.source.limitv"
             try:
                 # 基础配置 + 低电流加速
-                self.session.write(f"{ch}.source.func = {func}")
+                self.session.write(f"{src_ch}.source.func = {func}")
                 self.session.write(f"{limit_field} = {comp_val}")
-                self.session.write(f"{ch}.source.output = {ch}.OUTPUT_ON")
+                self.session.write(f"{src_ch}.source.output = {src_ch}.OUTPUT_ON")
                 self._apply_low_current_speed_settings_2636()
             except Exception as exc:
                 raise RuntimeError(f"预配置 2636B 失败: {exc}") from exc
@@ -532,17 +672,18 @@ class KeithleyInstrument:
             levels_str = ",".join(str(float(v)) for v in levels)
             delay_val = max(0.0, float(delay or 0.0))
             script = """
-local ch = %s
+local src = %s
+local meas = %s
 local lvls = {%s}
 local out = {}
 for i, v in ipairs(lvls) do
     %s = v
-    local m = ch.measure.iv()
-    out[#out + 1] = string.format("%g,%g", m[2], m[1])
+    local m = meas.measure.iv()
+    out[#out + 1] = string.format("%%g,%%g", m[2], m[1])
     if %f > 0 then delay(%f) end
 end
 print(table.concat(out, ";"))
-""" % (ch, levels_str, level_field, delay_val, delay_val)
+""" % (src_ch, meas_ch, levels_str, level_field, delay_val, delay_val)
             try:
                 raw = self.session.query(script).strip()
             except Exception as exc:
@@ -699,6 +840,8 @@ class App:
         self.current_range_override_var = tk.StringVar(value="1e-6")
         self.model_select_var = tk.StringVar(value="自动识别")
         self.channel_select_var = tk.StringVar(value="A")
+        self.source_channel_var = tk.StringVar(value="A")
+        self.measure_channel_var = tk.StringVar(value="A")
         self.buffer_mode_var = tk.BooleanVar(value=False)
         self.baud_rate_var = tk.StringVar(value="9600")
         self._filtered_pressure = None                       # 压力最新值（保留原接口）
@@ -820,6 +963,31 @@ class App:
             values=["A", "B"],
         )
         self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
+
+        self.four_wire_channel_frame = ttk.Frame(model_frame)
+        self.source_channel_label = ttk.Label(self.four_wire_channel_frame, text="源通道:")
+        self.source_channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.source_channel_combo = ttk.Combobox(
+            self.four_wire_channel_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.source_channel_var,
+            values=["A", "B"],
+        )
+        self.source_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.source_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
+        self.measure_channel_label = ttk.Label(self.four_wire_channel_frame, text="测量通道:")
+        self.measure_channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.measure_channel_combo = ttk.Combobox(
+            self.four_wire_channel_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.measure_channel_var,
+            values=["A", "B"],
+        )
+        self.measure_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.measure_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
 
         ttk.Label(model_frame, text="串口波特率:").pack(side=tk.LEFT, padx=(0, 4))
         self.baud_combo = ttk.Combobox(
@@ -985,7 +1153,7 @@ class App:
             frame,
             text="低电流加速模式（更快/更噪）",
             variable=self.low_current_speed_mode_var,
-            command=self._sync_low_current_controls,
+            command=self._on_low_current_toggle,
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             frame,
@@ -1016,6 +1184,13 @@ class App:
                 frame.grid_remove()
                 lbl.grid_remove()
                 entry.grid_remove()
+
+    def _on_low_current_toggle(self):
+        self._sync_low_current_controls()
+        try:
+            self.instrument.set_low_current_mode(bool(self.low_current_speed_mode_var.get()))
+        except Exception:
+            pass
 
     def _build_iv_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
@@ -1449,18 +1624,40 @@ class App:
 
     def _sync_model_channel_controls(self):
         model = self.model_select_var.get()
-        if model == "2636B":
-            try:
-                self.channel_label.pack(side=tk.LEFT, padx=(0, 4))
-                self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
-            except Exception:
-                pass
-        else:
-            try:
+        four_wire_var = getattr(self, "four_wire_var", None)
+        four_wire = bool(four_wire_var.get()) if isinstance(four_wire_var, tk.Variable) else False
+        is_2636b = model == "2636B"
+        try:
+            if is_2636b and four_wire:
                 self.channel_label.pack_forget()
                 self.channel_combo.pack_forget()
-            except Exception:
-                pass
+                self.four_wire_channel_frame.pack(side=tk.LEFT, padx=(0, 8))
+            elif is_2636b:
+                self.four_wire_channel_frame.pack_forget()
+                self.channel_label.pack(side=tk.LEFT, padx=(0, 4))
+                self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+            else:
+                self.four_wire_channel_frame.pack_forget()
+                self.channel_label.pack_forget()
+                self.channel_combo.pack_forget()
+        except Exception:
+            pass
+        self._apply_channel_selection_to_instrument()
+
+    def _apply_channel_selection_to_instrument(self):
+        model = (self.model_select_var.get() or "").upper()
+        instrument_model = (getattr(self.instrument, "model", None) or "").upper()
+        is_2636b = model == "2636B" or instrument_model == "2636B"
+        four_wire_var = getattr(self, "four_wire_var", None)
+        four_wire = bool(four_wire_var.get()) if isinstance(four_wire_var, tk.Variable) else False
+        try:
+            if is_2636b and four_wire:
+                self.instrument.set_source_channel(self.source_channel_var.get())
+                self.instrument.set_measure_channel(self.measure_channel_var.get())
+            else:
+                self.instrument.set_channel(self.channel_select_var.get())
+        except Exception:
+            pass
 
     def _sync_baud_control(self):
         addr = (self.resource_combo.get() or "").upper()
@@ -1494,6 +1691,15 @@ class App:
             pass
 
         enable = bool(self.four_wire_var.get())
+        if enable and self.model_select_var.get() == "2636B":
+            try:
+                base_ch = self.channel_select_var.get() or "A"
+                self.source_channel_var.set(self.source_channel_var.get() or base_ch)
+                self.measure_channel_var.set(self.measure_channel_var.get() or base_ch)
+            except Exception:
+                pass
+        self._sync_model_channel_controls()
+        self._apply_channel_selection_to_instrument()
         # 同步到仪器
         try:
             self.instrument.set_remote_sense(enable)
@@ -1512,7 +1718,7 @@ class App:
         selected_model = self.model_select_var.get()
         forced_model = selected_model if selected_model in ("2400", "2636B") else None
         self.instrument.set_forced_model(forced_model)
-        self.instrument.set_channel(self.channel_select_var.get())
+        self._apply_channel_selection_to_instrument()
         simulate = self.sim_var.get()
         if simulate:
             status = self.instrument.connect(address=None, simulate=True)
@@ -1590,9 +1796,8 @@ class App:
 
         model = getattr(self.instrument, "model", None)
         low_current_mode = bool(config.get("low_current_speed_mode", False))
-        self.instrument.low_current_speed_mode = low_current_mode
+        self.instrument.set_low_current_mode(low_current_mode)
         self.instrument.current_range_override = config.get("current_range_override")
-        self.instrument._low_current_applied = False
         try:
             nplc = float(self.integration_time_var.get())
         except Exception:
@@ -2679,6 +2884,10 @@ class App:
         self._stop_tcp_server()
         self._clear_tcp_waiters()
         try:
+            self.instrument.set_low_current_mode(False)
+        except Exception:
+            pass
+        try:
             self.instrument.output_off()
         except Exception:
             pass
@@ -2690,83 +2899,33 @@ class App:
 
     # ---- 参数保存 ----
 
+    def _iter_persistable_variables(self):
+        runtime_only = {"ofr_pressure_var", "ofr_current_var", "ofr_onoff_var", "ofr_ioff_var"}
+        for name, value in vars(self).items():
+            if isinstance(value, tk.Variable) and name not in runtime_only:
+                yield name, value
+
     def _save_settings(self):
-        cfg = {
-            "save_root": self.save_root_var.get(),
-            "auto_save": self.auto_save_var.get(),
-            "four_wire": bool(getattr(self, "four_wire_var", tk.BooleanVar(value=False)).get()),
-            "plot_style": getattr(self, "plot_style_var", tk.StringVar(value="线")).get(),
-            "integration_nplc": float(self.integration_time_var.get())
-            if hasattr(self, "integration_time_var")
-            else 0.0,
-            "low_current_speed_mode": self.low_current_speed_mode_var.get(),
-            "current_range_override": self._get_current_range_override_value(),
-            "model_select": self.model_select_var.get(),
-            "channel_select": self.channel_select_var.get(),
-            "buffer_mode": self.buffer_mode_var.get(),
-            "baud_rate": self.baud_rate_var.get(),
-            "iv": {
-                "source_mode": self.iv_source_mode_var.get(),
-                "start": self.iv_start_var.get(),
-                "stop": self.iv_stop_var.get(),
-                "step": self.iv_step_var.get(),
-                "points": self.iv_points_var.get(),
-                "cycles": self.iv_cycles_var.get(),
-                "back_and_forth": self.iv_backforth_var.get(),
-                "triangle_from_zero": self.iv_triangle_from_zero_var.get(),
-                "delay": self.iv_delay_var.get(),
-                "compliance": self.iv_compliance_var.get(),
-            },
-            "iv_quality": {
-                "k": self.iv_quality_k_var.get(),
-                "max_jump_ratio": self.iv_quality_jump_ratio_var.get(),
-                "max_flip_count": self.iv_quality_flip_count_var.get(),
-                "max_retry": self.iv_quality_max_retry_var.get(),
-            },
-            "it": {
-                "bias": self.it_bias_var.get(),
-                "delay": self.it_delay_var.get(),
-                "points": self.it_points_var.get(),
-                "infinite": self.it_infinite_var.get(),
-                "compliance": self.it_compliance_var.get(),
-            },
-            "vt": {
-                "bias": self.vt_bias_var.get(),
-                "delay": self.vt_delay_var.get(),
-                "points": self.vt_points_var.get(),
-                "infinite": self.vt_infinite_var.get(),
-                "compliance": self.vt_compliance_var.get(),
-            },
-            "rt": {
-                "bias": self.rt_bias_var.get(),
-                "delay": self.rt_delay_var.get(),
-                "points": self.rt_points_var.get(),
-                "infinite": self.rt_infinite_var.get(),
-                "compliance": self.rt_compliance_var.get(),
-            },
-            "pt": {
-                "bias": self.pt_bias_var.get(),
-                "delay": self.pt_delay_var.get(),
-                "points": self.pt_points_var.get(),
-                "infinite": self.pt_infinite_var.get(),
-                "compliance": self.pt_compliance_var.get(),
-            },
-            "ofr": {
-                "voltage": self.ofr_voltage_var.get(),
-                "zero_tol": self.ofr_zero_tol_var.get(),
-                "bin_step": self.ofr_bin_step_var.get(),
-                "off_min": self.ofr_off_min_points_var.get(),
-            },
-            "tcp": {
-                "host": self.tcp_host_var.get(),
-                "port": self.tcp_port_var.get(),
-            },
-        }
+        cfg = {"variables": {}}
+        for name, var in self._iter_persistable_variables():
+            try:
+                cfg["variables"][name] = var.get()
+            except Exception:
+                continue
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def _apply_variable_settings(self, mapping: dict):
+        for name, value in (mapping or {}).items():
+            var = getattr(self, name, None)
+            if isinstance(var, tk.Variable):
+                try:
+                    var.set(value)
+                except Exception:
+                    continue
 
     def _load_settings(self):
         if not os.path.exists(self.config_path):
@@ -2776,10 +2935,21 @@ class App:
                 cfg = json.load(f)
         except Exception:
             return
+
+        if "variables" in cfg:
+            self._apply_variable_settings(cfg.get("variables", {}))
+        else:
+            self._load_settings_legacy(cfg)
+
+        self._post_settings_load()
+
+    def _load_settings_legacy(self, cfg: dict):
         self.save_root_var.set(cfg.get("save_root", ""))
         self.auto_save_var.set(cfg.get("auto_save", False))
         self.model_select_var.set(cfg.get("model_select", "自动识别"))
         self.channel_select_var.set(cfg.get("channel_select", "A"))
+        self.source_channel_var.set(cfg.get("source_channel_var", self.channel_select_var.get()))
+        self.measure_channel_var.set(cfg.get("measure_channel_var", self.channel_select_var.get()))
         self.buffer_mode_var.set(cfg.get("buffer_mode", False))
         self.baud_rate_var.set(str(cfg.get("baud_rate", "9600")))
 
@@ -2794,25 +2964,11 @@ class App:
 
         self.low_current_speed_mode_var.set(cfg.get("low_current_speed_mode", False))
         self.current_range_override_var.set(str(cfg.get("current_range_override", "1e-6")))
-        try:
-            self._sync_low_current_controls()
-        except Exception:
-            pass
-        try:
-            self._sync_model_channel_controls()
-            self._sync_baud_control()
-        except Exception:
-            pass
 
-        # 读取四线制与曲线样式
         if hasattr(self, "four_wire_var"):
             self.four_wire_var.set(cfg.get("four_wire", False))
         if hasattr(self, "plot_style_var"):
             self.plot_style_var.set(cfg.get("plot_style", "线"))
-            try:
-                self._apply_plot_style()
-            except Exception:
-                pass
 
         iv = cfg.get("iv", {})
         self.iv_source_mode_var.set(iv.get("source_mode", "Voltage"))
@@ -2881,6 +3037,26 @@ class App:
         tcp = cfg.get("tcp", {})
         self.tcp_host_var.set(tcp.get("host", "127.0.0.1"))
         self.tcp_port_var.set(tcp.get("port", 50000))
+
+    def _post_settings_load(self):
+        try:
+            self._apply_channel_selection_to_instrument()
+        except Exception:
+            pass
+        try:
+            self._sync_model_channel_controls()
+            self._sync_baud_control()
+        except Exception:
+            pass
+        try:
+            self._on_low_current_toggle()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "plot_style_var"):
+                self._apply_plot_style()
+        except Exception:
+            pass
 
     def run(self):
         self.root.mainloop()
