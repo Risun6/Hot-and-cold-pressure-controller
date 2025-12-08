@@ -196,6 +196,10 @@ class SequenceRunner(threading.Thread):
         self.temp_lock = temp_lock
         self.press_lock = press_lock
 
+        if "pressures" not in self.plan and "currents" in self.plan:
+            # 兼容旧版字段名
+            self.plan["pressures"] = self.plan.get("currents", [])
+
     def stop(self) -> None:
         self.stop_event.set()
 
@@ -426,7 +430,7 @@ class SequenceRunner(threading.Thread):
         row: int,
         col: int,
         temperature: float,
-        current: float,
+        pressure: float,
         temp_status: Dict,
         pressure_status: Dict,
     ) -> None:
@@ -435,8 +439,8 @@ class SequenceRunner(threading.Thread):
             "row": row,
             "col": col,
             "temperature": temperature,
-            "current": current,
-            "pressure": current,  # 按原始字段保留
+            "current": pressure,
+            "pressure": pressure,  # 按原始字段保留
             "temp_status": temp_status,
             "pressure_status": pressure_status,
             "status": "completed",
@@ -468,7 +472,7 @@ class SequenceRunner(threading.Thread):
             return
 
         temps = self.plan["temperatures"]
-        currents = self.plan["pressures"]
+        pressures = self.plan["pressures"]
         timeout = self.plan.get("cell_timeout", DEFAULT_CELL_TIMEOUT)
         t_thr = self.plan.get("temp_mae", DEFAULT_TEMP_MAE)
         t_hold = self.plan.get("temp_hold", DEFAULT_TEMP_HOLD)
@@ -511,12 +515,12 @@ class SequenceRunner(threading.Thread):
                         self.app.mark_column_timeout(col, "温度后压力不稳")
                         continue
                     break
-                for row, current_target in enumerate(currents):
+                for row, pressure_target in enumerate(pressures):
                     if self.stop_event.is_set():
                         break
                     self.app.mark_cell_in_progress(row, col)
-                    self.log(f"设定电流 {current_target}，等待稳定")
-                    if not self.ensure_pressure_running(pressure_client, current_target):
+                    self.log(f"设定压力 {pressure_target}，等待稳定")
+                    if not self.ensure_pressure_running(pressure_client, pressure_target):
                         self.app.mark_cell_error(row, col, "压力失败")
                         continue
                     press_status, press_timeout = self.wait_pressure(
@@ -553,7 +557,14 @@ class SequenceRunner(threading.Thread):
                             self.app.mark_cell_error(row, col, "多压力失败")
                             continue
 
-                    self._record_result(row, col, temp_target, current_target, temp_recheck, press_status)
+                    self._record_result(
+                        row,
+                        col,
+                        temp_target,
+                        pressure_target,
+                        temp_recheck,
+                        press_status,
+                    )
                     self.app.mark_cell_done(row, col)
         finally:
             try:
@@ -608,7 +619,7 @@ class MultiSequenceApp(ttk.Frame):
         self._press_handler_lock = threading.RLock() if self._press_handler else None
 
         self.temperature_vars: List[tk.StringVar] = []
-        self.current_vars: List[tk.StringVar] = []
+        self.pressure_vars: List[tk.StringVar] = []
         self.cell_labels: Dict[Tuple[int, int], ttk.Label] = {}
         self.cell_states: Dict[Tuple[int, int], Tuple[str, str]] = {}
 
@@ -715,7 +726,7 @@ class MultiSequenceApp(ttk.Frame):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
         self._bind_mousewheel(canvas)
 
-        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：压力/电流/序列量纲）")
+        matrix_frame = ttk.Labelframe(main, text="测试矩阵（列：温度 °C / 行：压力/序列量纲）")
         matrix_frame.pack(fill=tk.X, pady=8)
 
         toolbar = ttk.Frame(matrix_frame)
@@ -726,10 +737,10 @@ class MultiSequenceApp(ttk.Frame):
         ttk.Button(toolbar, text="删除温度列", command=self.remove_temperature_column, bootstyle="outline-secondary").pack(
             side=tk.LEFT, padx=4
         )
-        ttk.Button(toolbar, text="添加电流行", command=self.add_current_row, bootstyle="outline-info").pack(
+        ttk.Button(toolbar, text="添加压力行", command=self.add_pressure_row, bootstyle="outline-info").pack(
             side=tk.LEFT, padx=12
         )
-        ttk.Button(toolbar, text="删除电流行", command=self.remove_current_row, bootstyle="outline-secondary").pack(
+        ttk.Button(toolbar, text="删除压力行", command=self.remove_pressure_row, bootstyle="outline-secondary").pack(
             side=tk.LEFT, padx=4
         )
         ttk.Button(toolbar, text="重置状态", command=self.reset_matrix_statuses, bootstyle="outline-warning").pack(
@@ -864,7 +875,7 @@ class MultiSequenceApp(ttk.Frame):
 
         rt_row2 = ttk.Frame(realtime_frame)
         rt_row2.pack(fill=tk.X, pady=2)
-        ttk.Label(rt_row2, text="压力/电流 当前/目标：").pack(side=tk.LEFT, padx=4)
+        ttk.Label(rt_row2, text="压力 当前/目标：").pack(side=tk.LEFT, padx=4)
         ttk.Label(rt_row2, textvariable=self.press_live_var, width=10, anchor=tk.E).pack(side=tk.LEFT)
         ttk.Label(rt_row2, text="→").pack(side=tk.LEFT, padx=2)
         ttk.Label(rt_row2, textvariable=self.press_target_var, width=10, anchor=tk.E).pack(side=tk.LEFT)
@@ -910,8 +921,8 @@ class MultiSequenceApp(ttk.Frame):
         ax_temp.grid(True, alpha=0.3)
         ax_temp.legend(loc="upper right", fontsize=8)
 
-        ax_press.set_title("压力/电流随时间变化")
-        ax_press.set_ylabel("压力 / 电流")
+        ax_press.set_title("压力随时间变化")
+        ax_press.set_ylabel("压力")
         ax_press.set_xlabel("时间 (s)")
         self._press_line_actual, = ax_press.plot([], [], color="#2ca02c", linewidth=1.6, label="Actual Pressure")
         self._press_line_target, = ax_press.plot(
@@ -934,7 +945,7 @@ class MultiSequenceApp(ttk.Frame):
         for value in (25, 35, 45):
             self.add_temperature_column(str(value))
         for value in (500, 1000, 1500):
-            self.add_current_row(str(value))
+            self.add_pressure_row(str(value))
         self.reset_matrix_statuses()
 
     def add_temperature_column(self, value: Optional[str] = None) -> None:
@@ -948,16 +959,23 @@ class MultiSequenceApp(ttk.Frame):
         self.temperature_vars.pop()
         self._render_matrix_table()
 
-    def add_current_row(self, value: Optional[str] = None) -> None:
+    def add_pressure_row(self, value: Optional[str] = None) -> None:
         var = tk.StringVar(value=value or "")
-        self.current_vars.append(var)
+        self.pressure_vars.append(var)
         self._render_matrix_table()
 
-    def remove_current_row(self) -> None:
-        if not self.current_vars:
+    def remove_pressure_row(self) -> None:
+        if not self.pressure_vars:
             return
-        self.current_vars.pop()
+        self.pressure_vars.pop()
         self._render_matrix_table()
+
+    # 兼容旧命名
+    def add_current_row(self, value: Optional[str] = None) -> None:
+        self.add_pressure_row(value)
+
+    def remove_current_row(self) -> None:
+        self.remove_pressure_row()
 
     def _render_matrix_table(self) -> None:
         for widget in self.matrix_grid.winfo_children():
@@ -965,14 +983,14 @@ class MultiSequenceApp(ttk.Frame):
         self.cell_labels.clear()
         current_states = dict(self.cell_states)
 
-        header = ttk.Label(self.matrix_grid, text="电流→温度", anchor=tk.CENTER, width=12, bootstyle=SECONDARY)
+        header = ttk.Label(self.matrix_grid, text="压力→温度", anchor=tk.CENTER, width=12, bootstyle=SECONDARY)
         header.grid(row=0, column=0, padx=2, pady=2, sticky=tk.NSEW)
 
         for col, var in enumerate(self.temperature_vars, start=1):
             entry = ttk.Entry(self.matrix_grid, textvariable=var, width=10)
             entry.grid(row=0, column=col, padx=2, pady=2, sticky=tk.NSEW)
 
-        for row, var in enumerate(self.current_vars, start=1):
+        for row, var in enumerate(self.pressure_vars, start=1):
             entry = ttk.Entry(self.matrix_grid, textvariable=var, width=10)
             entry.grid(row=row, column=0, padx=2, pady=2, sticky=tk.NSEW)
             for col in range(len(self.temperature_vars)):
@@ -1017,7 +1035,7 @@ class MultiSequenceApp(ttk.Frame):
 
     # Runner integration --------------------------------------------------
     def get_row_count(self) -> int:
-        return len(self.current_vars)
+        return len(self.pressure_vars)
 
     def get_col_count(self) -> int:
         return len(self.temperature_vars)
@@ -1046,11 +1064,11 @@ class MultiSequenceApp(ttk.Frame):
 
     def build_plan(self) -> Dict:
         temps = self._collect_numbers(self.temperature_vars, "温度")
-        currents = self._collect_numbers(self.current_vars, "电流")
+        pressures = self._collect_numbers(self.pressure_vars, "压力")
         if not temps:
             raise ValueError("请至少输入一个温度目标")
-        if not currents:
-            raise ValueError("请至少输入一个电流目标")
+        if not pressures:
+            raise ValueError("请至少输入一个压力目标")
         timeout = max(5.0, float(self.cell_timeout_var.get()))
         confirm_need = max(1, int(self.confirm_count_var.get()))
         try:
@@ -1068,7 +1086,8 @@ class MultiSequenceApp(ttk.Frame):
             "press_host": PRESS_DEFAULT_HOST,
             "press_port": PRESS_DEFAULT_PORT,
             "temperatures": temps,
-            "pressures": currents,
+            "pressures": pressures,
+            "currents": pressures,  # 兼容旧字段名
             "cell_timeout": timeout,
             "temp_mae": DEFAULT_TEMP_MAE,
             "temp_hold": DEFAULT_TEMP_HOLD,
@@ -1500,8 +1519,9 @@ class MultiSequenceApp(ttk.Frame):
         self.results.append(result)
         pressure_error = result.get("pressure_status", {}).get("last", {}).get("error")
         temp_error = result.get("temp_status", {}).get("error")
+        pressure_value = result.get("pressure", result.get("current"))
         self.log(
-            f"记录结果 行{result['row']+1}/列{result['col']+1}：温度={result['temperature']}, 电流={result['current']}, "
+            f"记录结果 行{result['row']+1}/列{result['col']+1}：温度={result['temperature']}, 压力={pressure_value}, "
             f"温度误差={temp_error}, 压力误差={pressure_error}"
         )
 
