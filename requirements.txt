@@ -1,0 +1,10 @@
+numpy
+pyvisa
+pyvisa-py
+pyserial
+ttkbootstrap
+Pillow
+matplotlib
+openpyxl
+pyautogui
+keyboard
