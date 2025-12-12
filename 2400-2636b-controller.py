@@ -226,26 +226,12 @@ class KeithleyInstrument:
 
     def close(self):
         with self.lock:
-            try:
-                if self.session is not None:
-                    try:
-                        self.session.close()
-                    except Exception:
-                        pass
-                    finally:
-                        self.session = None
-            finally:
+            if self.session is not None:
                 try:
-                    self.set_low_current_mode(False)
+                    self.session.close()
                 except Exception:
                     pass
-                self._low_current_snapshot.clear()
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+                self.session = None
 
     def configure_source(self, mode, level, compliance):
         """设置源模式 + 电平，并记录 last_setpoint 用于仿真"""
@@ -840,15 +826,12 @@ class App:
         self.root.rowconfigure(1, weight=1)
         self.root.columnconfigure(0, weight=1)
 
-        self._setup_modern_style()
+        self._setup_style()
 
         self.instrument = KeithleyInstrument()
         self.instrument.log_callback = self._log
         self.queue = queue.Queue()
         self.measurement_thread = None
-        self.thread_semaphore = threading.Semaphore(1)
-        self._measurement_lock_acquired = False
-        self.is_measuring = False
         self.stop_event = threading.Event()
         self.tcp_stop_event = threading.Event()
         self.tcp_server_thread = None
@@ -912,81 +895,225 @@ class App:
         self._start_tcp_server()
         self._poll_queue()
 
-    def _setup_modern_style(self):
-        """设置现代化界面样式"""
+    def _setup_style(self):
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except Exception:
             pass
 
-        colors = {
-            "primary": "#007bff",
-            "secondary": "#6c757d",
-            "success": "#28a745",
-            "danger": "#dc3545",
-            "warning": "#ffc107",
-            "info": "#17a2b8",
-            "light": "#f8f9fa",
-            "dark": "#343a40",
-        }
+        style.configure("TLabel", font=("Microsoft YaHei", 9))
+        style.configure("TButton", font=("Microsoft YaHei", 9))
+        style.configure("TCheckbutton", font=("Microsoft YaHei", 9))
+        style.configure("TNotebook.Tab", font=("Microsoft YaHei", 9))
+        style.configure("TLabelframe.Label", font=("Microsoft YaHei", 9, "bold"))
 
-        style.configure("TLabel", font=("Segoe UI", 9))
-        style.configure("TButton", font=("Segoe UI", 9), padding=6)
-        style.configure("TEntry", padding=5)
-        style.configure("TCombobox", padding=5)
-        style.configure("TCheckbutton", font=("Segoe UI", 9))
-        style.configure("TRadiobutton", font=("Segoe UI", 9))
-        style.configure("TNotebook.Tab", font=("Segoe UI", 9, "bold"), padding=[10, 5])
-        style.configure("TLabelframe", background=colors["light"], relief="solid")
-        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-
-        style.configure(
-            "Horizontal.TProgressbar",
-            background=colors["primary"],
-            troughcolor=colors["light"],
-            bordercolor=colors["light"],
-            lightcolor=colors["primary"],
-            darkcolor=colors["primary"],
-            thickness=12,
-        )
-        style.configure(
-            "Treeview",
-            font=("Segoe UI", 9),
-            rowheight=22,
-            background=colors["light"],
-            fieldbackground=colors["light"],
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", colors["primary"])],
-            foreground=[("selected", "white")],
-        )
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=8)
-        style.configure("Success.TButton", background=colors["success"], foreground="white")
-        style.configure("Danger.TButton", background=colors["danger"], foreground="white")
+        style.configure("TProgressbar", thickness=12)
 
     def _build_ui(self):
-        # 背景与根布局
-        self.root.configure(bg="#f0f0f0")
-        self.root.rowconfigure(0, weight=1)
-        self.root.columnconfigure(0, weight=1)
+        # 顶部：连接 + 保存设置
+        top_lf = ttk.Labelframe(self.root, text="连接 & 保存设置", padding=8)
+        top_lf.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        top_lf.columnconfigure(2, weight=1)
 
-        # 主分栏
-        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_pane.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        ttk.Label(top_lf, text="仪器地址:").grid(row=0, column=0, sticky="w")
+        self.resource_combo = ttk.Combobox(top_lf, width=28, state="readonly")
+        self.resource_combo.grid(row=0, column=1, sticky="w")
+        self.resource_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_baud_control())
+        ttk.Button(top_lf, text="刷新", command=self.refresh_resources).grid(row=0, column=2, sticky="w", padx=(6, 0))
 
-        left_frame = ttk.Frame(main_pane)
-        right_frame = ttk.Frame(main_pane)
-        main_pane.add(left_frame, weight=1)
-        main_pane.add(right_frame, weight=3)
+        self.sim_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top_lf, text="仿真模式", variable=self.sim_var, command=self.on_sim_toggle).grid(
+            row=0, column=3, sticky="w", padx=(10, 0)
+        )
 
-        self._build_left_panel(left_frame)
-        self._build_right_panel(right_frame)
+        # 四线制开关
+        self.four_wire_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            top_lf,
+            text="四线制",
+            variable=self.four_wire_var,
+            command=self.on_four_wire_toggle,
+        ).grid(row=0, column=4, sticky="w", padx=(10, 0))
 
-        # TCP 区域保持在底部
+        ttk.Button(top_lf, text="连接", command=self.connect_instrument).grid(row=0, column=5, sticky="w", padx=(10, 0))
+        self.status_label = ttk.Label(top_lf, text="未连接（仿真）")
+        self.status_label.grid(row=0, column=6, sticky="w", padx=(6, 0))
+
+        model_frame = ttk.Frame(top_lf)
+        model_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        ttk.Label(model_frame, text="仪器型号:").pack(side=tk.LEFT, padx=(0, 4))
+        self.model_combo = ttk.Combobox(
+            model_frame,
+            width=10,
+            state="readonly",
+            textvariable=self.model_select_var,
+            values=["自动识别", "2400", "2636B"],
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_model_channel_controls())
+
+        self.channel_label = ttk.Label(model_frame, text="2636B 通道:")
+        self.channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.channel_combo = ttk.Combobox(
+            model_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.channel_select_var,
+            values=["A", "B"],
+        )
+        self.channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
+
+        self.four_wire_channel_frame = ttk.Frame(model_frame)
+        self.source_channel_label = ttk.Label(self.four_wire_channel_frame, text="源通道:")
+        self.source_channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.source_channel_combo = ttk.Combobox(
+            self.four_wire_channel_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.source_channel_var,
+            values=["A", "B"],
+        )
+        self.source_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.source_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
+        self.measure_channel_label = ttk.Label(self.four_wire_channel_frame, text="测量通道:")
+        self.measure_channel_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.measure_channel_combo = ttk.Combobox(
+            self.four_wire_channel_frame,
+            width=5,
+            state="readonly",
+            textvariable=self.measure_channel_var,
+            values=["A", "B"],
+        )
+        self.measure_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.measure_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
+
+        ttk.Label(model_frame, text="串口波特率:").pack(side=tk.LEFT, padx=(0, 4))
+        self.baud_combo = ttk.Combobox(
+            model_frame,
+            width=8,
+            state="readonly",
+            values=["9600", "19200", "57600", "115200"],
+            textvariable=self.baud_rate_var,
+        )
+        self.baud_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(top_lf, text="保存根文件夹:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.save_root_var = tk.StringVar()
+        self.save_root_entry = ttk.Entry(top_lf, textvariable=self.save_root_var, width=40)
+        self.save_root_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(top_lf, text="浏览...", command=self.choose_save_root).grid(
+            row=2, column=4, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+        self.auto_save_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top_lf, text="自动保存", variable=self.auto_save_var).grid(
+            row=2, column=5, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+
+        interval_frame = ttk.Frame(top_lf)
+        interval_frame.grid(row=3, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        ttk.Label(interval_frame, text="积分时间(NPLC):").pack(side=tk.LEFT, padx=5, pady=2)
+        self.integration_time_entry = ttk.Entry(
+            interval_frame,
+            width=8,
+            textvariable=self.integration_time_var,
+        )
+        self.integration_time_entry.pack(side=tk.LEFT, padx=5, pady=2)
+
+        # 中间：左窄（参数+日志），右宽（图表）
+        mid_lf = ttk.Labelframe(self.root, text="模式参数 & 实时显示", padding=8)
+        mid_lf.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        mid_lf.rowconfigure(0, weight=1)
+        mid_lf.rowconfigure(1, weight=1)
+        mid_lf.columnconfigure(0, weight=1)  # 左侧
+        mid_lf.columnconfigure(1, weight=3)  # 右侧
+
+        left_col = ttk.Frame(mid_lf)
+        left_col.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 4))
+        left_col.rowconfigure(0, weight=0)
+        left_col.rowconfigure(1, weight=1)
+        left_col.columnconfigure(0, weight=1)
+
+        self.notebook = ttk.Notebook(left_col)
+        self.notebook.grid(row=0, column=0, sticky="ew")
+        self._build_iv_tab()
+        self._build_it_tab()
+        self._build_vt_tab()
+        self._build_rt_tab()
+        self._build_pt_tab()
+        self._build_ofr_tab()
+
+        log_frame = ttk.Labelframe(left_col, text="日志", padding=6)
+        log_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        log_frame.rowconfigure(1, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(log_frame, text="输出:").grid(row=0, column=0, sticky="w")
+        self.log_text = tk.Text(log_frame, height=10, wrap="word")
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+
+        chart_frame = ttk.Labelframe(mid_lf, text="实时曲线", padding=6)
+        chart_frame.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(4, 0))
+        chart_frame.rowconfigure(0, weight=1)
+        chart_frame.columnconfigure(0, weight=1)
+
+        self.fig = Figure(figsize=(5, 4))
+        self.ax = self.fig.add_subplot(111)
+        self.fig.set_tight_layout(True)
+        self.ax.set_title("Live measurement")
+        self.ax.set_xlabel("Point index")
+        self.ax.set_ylabel("Value")
+        self.ax.grid(True, alpha=0.3, linestyle="--")
+        self.voltage_line, = self.ax.plot([], [], label="Voltage (V)")
+        self.current_line, = self.ax.plot([], [], label="Current (A)")
+        self.ofr_line, = self.ax.plot([], [], "o-", label="ON/OFF", color="#e67e22")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.grid(row=0, column=0, sticky="nsew")
+
+        # 曲线样式选择：线 / 点 / 线+点
+        style_frame = ttk.Frame(chart_frame)
+        style_frame.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(style_frame, text="曲线样式:").grid(row=0, column=0, sticky="w")
+
+        self.plot_style_var = tk.StringVar(value="线")
+        style_combo = ttk.Combobox(
+            style_frame,
+            textvariable=self.plot_style_var,
+            values=["线", "点", "线+点"],
+            state="readonly",
+            width=8,
+        )
+        style_combo.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        style_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_plot_style())
+
+        bottom = ttk.Frame(self.root, padding=8)
+        bottom.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        bottom.columnconfigure(2, weight=1)
+
+        self.start_button = ttk.Button(bottom, text="开始测量", command=self.start_measurement)
+        self.start_button.grid(row=0, column=0, padx=(0, 6))
+        self.stop_button = ttk.Button(bottom, text="停止", command=self.stop_measurement, state="disabled")
+        self.stop_button.grid(row=0, column=1, padx=(0, 6))
+
+        self.progress = ttk.Progressbar(bottom, mode="determinate", maximum=100)
+        self.progress.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+
+        ttk.Button(bottom, text="导出数据", command=self.export_data).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(bottom, text="导出日志", command=self.export_log).grid(row=0, column=4)
+
+        self.points_label = ttk.Label(bottom, text="点数: 0/0")
+        self.points_label.grid(row=0, column=5, padx=(10, 0))
+        self.eta_label = ttk.Label(bottom, text="剩余时间: --")
+        self.eta_label.grid(row=0, column=6, padx=(10, 0))
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # TCP 从机区域
         tcp_lf = ttk.Labelframe(self.root, text="TCP 从机", padding=8)
-        tcp_lf.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        tcp_lf.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
         tcp_lf.columnconfigure(3, weight=1)
 
         ttk.Label(tcp_lf, text="监听 IP:").grid(row=0, column=0, sticky="w")
@@ -1004,264 +1131,6 @@ class App:
         ttk.Button(tcp_lf, text="应用", command=self.apply_tcp_settings).grid(
             row=0, column=4, sticky="w", padx=(4, 0)
         )
-
-        self._sync_model_channel_controls()
-        self._sync_baud_control()
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _build_left_panel(self, parent):
-        left_notebook = ttk.Notebook(parent)
-        left_notebook.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-
-        conn_frame = self._build_connection_frame(left_notebook)
-        left_notebook.add(conn_frame, text="连接设置")
-
-        params_frame = self._build_parameters_frame(left_notebook)
-        left_notebook.add(params_frame, text="测量参数")
-
-        adv_frame = self._build_advanced_frame(left_notebook)
-        left_notebook.add(adv_frame, text="高级设置")
-
-        log_frame = ttk.Labelframe(parent, text="日志", padding=6)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
-        log_frame.rowconfigure(1, weight=1)
-        log_frame.columnconfigure(0, weight=1)
-
-        ttk.Label(log_frame, text="输出:").grid(row=0, column=0, sticky="w")
-        self.log_text = tk.Text(log_frame, height=12, wrap="word")
-        self.log_text.grid(row=1, column=0, sticky="nsew")
-
-    def _build_right_panel(self, parent):
-        self._build_control_buttons(parent)
-
-        chart_frame = ttk.Frame(parent)
-        chart_frame.pack(fill=tk.BOTH, expand=True)
-
-        toolbar_frame = ttk.Frame(chart_frame)
-        toolbar_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Label(toolbar_frame, text="曲线样式:").pack(side=tk.LEFT, padx=(0, 5))
-        self.plot_style_var = tk.StringVar(value="线")
-        style_combo = ttk.Combobox(
-            toolbar_frame,
-            textvariable=self.plot_style_var,
-            values=["线", "点", "线+点"],
-            state="readonly",
-            width=8,
-        )
-        style_combo.pack(side=tk.LEFT, padx=(0, 10))
-        style_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_plot_style())
-
-        self.fig = Figure(figsize=(6, 5))
-        self.ax = self.fig.add_subplot(111)
-        self.fig.set_tight_layout(True)
-        self.ax.set_title("Live measurement")
-        self.ax.set_xlabel("Point index")
-        self.ax.set_ylabel("Value")
-        self.ax.grid(True, alpha=0.3, linestyle="--")
-        self.voltage_line, = self.ax.plot([], [], label="Voltage (V)")
-        self.current_line, = self.ax.plot([], [], label="Current (A)")
-        self.ofr_line, = self.ax.plot([], [], "o-", label="ON/OFF", color="#e67e22")
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
-        self.canvas_widget = self.canvas.get_tk_widget()
-        self.canvas_widget.pack(fill=tk.BOTH, expand=True)
-
-        stats_frame = ttk.Frame(chart_frame)
-        stats_frame.pack(fill=tk.X, pady=(4, 0))
-        self.points_label = ttk.Label(stats_frame, text="点数: 0/0")
-        self.points_label.pack(side=tk.LEFT)
-        self.eta_label = ttk.Label(stats_frame, text="剩余时间: --")
-        self.eta_label.pack(side=tk.LEFT, padx=(10, 0))
-
-    def _build_control_buttons(self, parent):
-        control_frame = ttk.Frame(parent)
-        control_frame.pack(fill=tk.X, pady=(0, 8))
-
-        btn_frame = ttk.Frame(control_frame)
-        btn_frame.pack(fill=tk.X)
-
-        self.start_button = ttk.Button(
-            btn_frame, text="▶ 开始测量", command=self.start_measurement, style="Success.TButton", width=12
-        )
-        self.start_button.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.stop_button = ttk.Button(
-            btn_frame, text="⏹ 停止", command=self.stop_measurement, style="Danger.TButton", width=10, state="disabled"
-        )
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Button(btn_frame, text="📊 导出数据", command=self.export_data, width=10).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(btn_frame, text="📝 导出日志", command=self.export_log, width=10).pack(side=tk.LEFT)
-
-        progress_frame = ttk.Frame(control_frame)
-        progress_frame.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Label(progress_frame, text="进度:").pack(side=tk.LEFT)
-        self.progress = ttk.Progressbar(progress_frame, mode="determinate", maximum=100, length=260)
-        self.progress.pack(side=tk.LEFT, padx=(5, 5), fill=tk.X, expand=True)
-        self.progress_label = ttk.Label(progress_frame, text="0%", width=5)
-        self.progress_label.pack(side=tk.LEFT)
-        self.time_label = ttk.Label(progress_frame, text="剩余: --:--", width=10)
-        self.time_label.pack(side=tk.LEFT, padx=(10, 0))
-
-    def _build_connection_frame(self, parent):
-        frame = ttk.Frame(parent, padding=10)
-        frame.columnconfigure(0, weight=1)
-
-        sections = [
-            ("仪器连接", self._build_instrument_connection),
-            ("通道设置", self._build_channel_settings),
-            ("保存设置", self._build_save_settings),
-        ]
-
-        for i, (title, builder) in enumerate(sections):
-            section_frame = ttk.LabelFrame(frame, text=title, padding=8)
-            section_frame.grid(row=i, column=0, sticky="ew", pady=(0, 10))
-            section_frame.columnconfigure(0, weight=1)
-            builder(section_frame)
-
-        return frame
-
-    def _build_instrument_connection(self, parent):
-        ttk.Label(parent, text="资源地址:").grid(row=0, column=0, sticky="w", padx=(0, 5))
-        self.resource_combo = ttk.Combobox(parent, width=30, state="readonly")
-        self.resource_combo.grid(row=0, column=1, sticky="ew", padx=(0, 5))
-        self.resource_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_baud_control())
-        ttk.Button(parent, text="刷新", command=self.refresh_resources, width=8).grid(row=0, column=2, sticky="w")
-
-        self.sim_var = tk.BooleanVar(value=True)
-        sim_chk = ttk.Checkbutton(parent, text="仿真模式", variable=self.sim_var, command=self.on_sim_toggle)
-        sim_chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        self.baud_frame = ttk.Frame(parent)
-        self.baud_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(self.baud_frame, text="波特率:").pack(side=tk.LEFT, padx=(0, 5))
-        self.baud_combo = ttk.Combobox(
-            self.baud_frame,
-            width=10,
-            state="readonly",
-            values=["9600", "19200", "57600", "115200"],
-            textvariable=self.baud_rate_var,
-        )
-        self.baud_combo.pack(side=tk.LEFT)
-
-        ttk.Button(parent, text="连接仪器", command=self.connect_instrument, style="Accent.TButton").grid(
-            row=3, column=0, columnspan=3, pady=(12, 0), sticky="ew"
-        )
-
-        status_frame = ttk.Frame(parent)
-        status_frame.grid(row=4, column=0, columnspan=3, pady=(10, 0), sticky="ew")
-        ttk.Label(status_frame, text="状态:", font=("", 9, "bold")).pack(side=tk.LEFT)
-        self.status_label = ttk.Label(status_frame, text="未连接（仿真）", foreground="gray")
-        self.status_label.pack(side=tk.LEFT, padx=(5, 0))
-
-    def _build_channel_settings(self, parent):
-        row = 0
-        ttk.Label(parent, text="仪器型号:").grid(row=row, column=0, sticky="w")
-        self.model_combo = ttk.Combobox(
-            parent,
-            width=12,
-            state="readonly",
-            textvariable=self.model_select_var,
-            values=["自动识别", "2400", "2636B"],
-        )
-        self.model_combo.grid(row=row, column=1, sticky="w", padx=(6, 0))
-        self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_model_channel_controls())
-        row += 1
-
-        self.channel_label = ttk.Label(parent, text="2636B 通道:")
-        self.channel_label.grid(row=row, column=0, sticky="w", pady=(6, 0))
-        self.channel_combo = ttk.Combobox(
-            parent,
-            width=6,
-            state="readonly",
-            textvariable=self.channel_select_var,
-            values=["A", "B"],
-        )
-        self.channel_combo.grid(row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
-        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
-        row += 1
-
-        four_wire_frame = ttk.Frame(parent)
-        four_wire_frame.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.four_wire_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            four_wire_frame,
-            text="四线制",
-            variable=self.four_wire_var,
-            command=self.on_four_wire_toggle,
-        ).pack(side=tk.LEFT)
-
-        self.four_wire_channel_frame = ttk.Frame(parent)
-        self.four_wire_channel_frame.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self.source_channel_label = ttk.Label(self.four_wire_channel_frame, text="源通道:")
-        self.source_channel_label.pack(side=tk.LEFT, padx=(0, 4))
-        self.source_channel_combo = ttk.Combobox(
-            self.four_wire_channel_frame,
-            width=5,
-            state="readonly",
-            textvariable=self.source_channel_var,
-            values=["A", "B"],
-        )
-        self.source_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
-        self.source_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
-
-        self.measure_channel_label = ttk.Label(self.four_wire_channel_frame, text="测量通道:")
-        self.measure_channel_label.pack(side=tk.LEFT, padx=(0, 4))
-        self.measure_channel_combo = ttk.Combobox(
-            self.four_wire_channel_frame,
-            width=5,
-            state="readonly",
-            textvariable=self.measure_channel_var,
-            values=["A", "B"],
-        )
-        self.measure_channel_combo.pack(side=tk.LEFT, padx=(0, 8))
-        self.measure_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_channel_selection_to_instrument())
-
-    def _build_save_settings(self, parent):
-        ttk.Label(parent, text="保存根文件夹:").grid(row=0, column=0, sticky="w")
-        self.save_root_var = tk.StringVar()
-        self.save_root_entry = ttk.Entry(parent, textvariable=self.save_root_var, width=34)
-        self.save_root_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4), padx=(6, 0))
-        ttk.Button(parent, text="浏览...", command=self.choose_save_root, width=8).grid(
-            row=0, column=2, sticky="w", padx=(6, 0)
-        )
-
-        self.auto_save_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(parent, text="自动保存", variable=self.auto_save_var).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
-        )
-
-    def _build_parameters_frame(self, parent):
-        frame = ttk.Frame(parent, padding=6)
-        frame.columnconfigure(0, weight=1)
-
-        self.notebook = ttk.Notebook(frame)
-        self.notebook.grid(row=0, column=0, sticky="nsew")
-        self._build_iv_tab()
-        self._build_it_tab()
-        self._build_vt_tab()
-        self._build_rt_tab()
-        self._build_pt_tab()
-        self._build_ofr_tab()
-
-        return frame
-
-    def _build_advanced_frame(self, parent):
-        frame = ttk.Frame(parent, padding=10)
-        frame.columnconfigure(0, weight=1)
-
-        interval_frame = ttk.LabelFrame(frame, text="测量节奏", padding=8)
-        interval_frame.grid(row=0, column=0, sticky="ew")
-        ttk.Label(interval_frame, text="积分时间(NPLC):").grid(row=0, column=0, sticky="w")
-        self.integration_time_entry = ttk.Entry(interval_frame, width=10, textvariable=self.integration_time_var)
-        self.integration_time_entry.grid(row=0, column=1, sticky="w", padx=(6, 0))
-
-        return frame
 
         self._sync_model_channel_controls()
         self._sync_baud_control()
@@ -1911,79 +1780,67 @@ class App:
         self._log("已请求停止")
 
     def _initiate_measurement(self, mode, config, show_dialog: bool):
-        if not self.thread_semaphore.acquire(blocking=False):
+        if self.measurement_thread is not None and self.measurement_thread.is_alive():
             if show_dialog:
                 messagebox.showwarning("忙碌", "测量正在进行中")
             else:
                 self._log("TCP 请求被忽略：测量正在进行中")
             return False
 
-        self._measurement_lock_acquired = True
-        success = False
-        try:
-            if not self.instrument.simulated and self.instrument.session is None:
-                if show_dialog:
-                    messagebox.showwarning("未连接", "请先连接仪器或勾选仿真模式")
-                else:
-                    self._log("TCP 请求被忽略：未连接仪器")
-                return False
-
-            model = getattr(self.instrument, "model", None)
-            low_current_mode = bool(config.get("low_current_speed_mode", False))
-            self.instrument.set_low_current_mode(low_current_mode)
-            self.instrument.current_range_override = config.get("current_range_override")
-            try:
-                nplc = float(self.integration_time_var.get())
-            except Exception:
-                nplc = 0.0
-
-            model_upper = (model or "").upper()
-            if nplc <= 0:
-                nplc = 0.01 if low_current_mode else (0.01 if model_upper == "2636B" else 0.1)
-
-            try:
-                self.instrument.set_nplc(nplc)
-            except Exception:
-                pass
-
-            self.current_mode = mode
-            # 只在 IV 模式下记录源模式，其它模式用 None
-            self.current_source_mode = config.get("source_mode") if mode == "IV" else None
-            self.current_data = []
-            self.total_points = config.get("total_points", 0)
-            self.completed_points = 0
-            self.start_time = time.time()
-
-            self._reset_plot()
-
-            if self.total_points > 0:
-                self.progress.config(mode="determinate", maximum=self.total_points)
-                self.progress["value"] = 0
+        if not self.instrument.simulated and self.instrument.session is None:
+            if show_dialog:
+                messagebox.showwarning("未连接", "请先连接仪器或勾选仿真模式")
             else:
-                self.progress.config(mode="indeterminate")
-                self.progress.start(50)
+                self._log("TCP 请求被忽略：未连接仪器")
+            return False
 
-            self.stop_event.clear()
-            self.start_button.config(state="disabled")
-            self.stop_button.config(state="normal")
-            self._log(f"开始 {mode} 测量（模式: {self.instrument.conn_type}）")
+        model = getattr(self.instrument, "model", None)
+        low_current_mode = bool(config.get("low_current_speed_mode", False))
+        self.instrument.set_low_current_mode(low_current_mode)
+        self.instrument.current_range_override = config.get("current_range_override")
+        try:
+            nplc = float(self.integration_time_var.get())
+        except Exception:
+            nplc = 0.0
 
-            self.measurement_thread = threading.Thread(
-                target=self._run_measurement,
-                args=(mode, config),
-                daemon=True,
-            )
-            self.measurement_thread.start()
-            self.is_measuring = True
-            success = True
-            return True
-        finally:
-            if not success and self._measurement_lock_acquired:
-                try:
-                    self.thread_semaphore.release()
-                except Exception:
-                    pass
-                self._measurement_lock_acquired = False
+        model_upper = (model or "").upper()
+        if nplc <= 0:
+            nplc = 0.01 if low_current_mode else (0.01 if model_upper == "2636B" else 0.1)
+
+        try:
+            self.instrument.set_nplc(nplc)
+        except Exception:
+            pass
+
+        self.current_mode = mode
+        # 只在 IV 模式下记录源模式，其它模式用 None
+        self.current_source_mode = config.get("source_mode") if mode == "IV" else None
+        self.current_data = []
+        self.total_points = config.get("total_points", 0)
+        self.completed_points = 0
+        self.start_time = time.time()
+
+        self._reset_plot()
+
+        if self.total_points > 0:
+            self.progress.config(mode="determinate", maximum=self.total_points)
+            self.progress["value"] = 0
+        else:
+            self.progress.config(mode="indeterminate")
+            self.progress.start(50)
+
+        self.stop_event.clear()
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self._log(f"开始 {mode} 测量（模式: {self.instrument.conn_type}）")
+
+        self.measurement_thread = threading.Thread(
+            target=self._run_measurement,
+            args=(mode, config),
+            daemon=True,
+        )
+        self.measurement_thread.start()
+        return True
 
     def _run_measurement(self, mode, config):
         try:
@@ -2746,13 +2603,6 @@ class App:
             self.eta_label.config(text="剩余时间: --")
 
         self._log("测量结束")
-        self.is_measuring = False
-        if self._measurement_lock_acquired:
-            try:
-                self.thread_semaphore.release()
-            except Exception:
-                pass
-            self._measurement_lock_acquired = False
 
         if self.auto_save_var.get() and self.multi_tcp_pending_pressure is None:
             try:
@@ -3244,44 +3094,23 @@ class App:
             self.tcp_server_thread.join(timeout=1.0)
 
     def _tcp_server_loop(self, host, port):
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(1.0)
-
             try:
                 sock.bind((host, port))
-                sock.listen(5)
-            except OSError as exc:
-                self.queue.put(("log", f"TCP 绑定失败 {host}:{port}: {exc}"))
+                sock.listen()
+            except Exception as exc:
+                self.queue.put(("log", f"TCP 从机启动失败: {exc}"))
                 return
 
             self.queue.put(("log", f"TCP 从机监听 {host}:{port}"))
-
+            sock.settimeout(1.0)
             while not self.tcp_stop_event.is_set():
                 try:
                     conn, addr = sock.accept()
-                    conn.settimeout(10.0)
-                    threading.Thread(
-                        target=self._handle_tcp_client, args=(conn, addr), daemon=True
-                    ).start()
-                    self.queue.put(("log", f"TCP 客户端连接: {addr}"))
                 except socket.timeout:
                     continue
-                except OSError as exc:
-                    if not self.tcp_stop_event.is_set():
-                        self.queue.put(("log", f"TCP 接受连接错误: {exc}"))
-                    continue
-        except Exception as exc:  # noqa: BLE001
-            self.queue.put(("log", f"TCP 服务器错误: {exc}"))
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                threading.Thread(target=self._handle_tcp_client, args=(conn, addr), daemon=True).start()
 
     def _handle_tcp_client(self, conn, addr):
         with conn:
