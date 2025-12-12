@@ -35,6 +35,46 @@ except Exception:
     pyvisa = None
 
 
+class SimpleToolTip:
+    def __init__(self, widget, text: str, wraplength=360):
+        self.widget = widget
+        self.text = text
+        self.wraplength = wraplength
+        self.tip = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(
+            self.tip,
+            text=self.text,
+            justify="left",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            wraplength=self.wraplength,
+            background="#ffffe0",
+            foreground="#000",
+        )
+        lbl.pack()
+
+    def _hide(self, _=None):
+        if self.tip:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+
+
 class KeithleyInstrument:
     """封装 Keithley 2400 / 2636B 仪器，支持仿真模式（对称肖特基 I-V）"""
 
@@ -1031,12 +1071,20 @@ class App:
 
         left_col = ttk.Frame(mid_lf)
         left_col.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 4))
-        left_col.rowconfigure(0, weight=0)
-        left_col.rowconfigure(1, weight=1)
+        left_col.rowconfigure(0, weight=1)
         left_col.columnconfigure(0, weight=1)
 
-        self.notebook = ttk.Notebook(left_col)
-        self.notebook.grid(row=0, column=0, sticky="ew")
+        self.left_paned = ttk.Panedwindow(left_col, orient=tk.VERTICAL)
+        self.left_paned.grid(row=0, column=0, sticky="nsew")
+
+        nb_container = ttk.Frame(self.left_paned)
+        log_container = ttk.Frame(self.left_paned)
+
+        self.left_paned.add(nb_container, weight=3)
+        self.left_paned.add(log_container, weight=1)
+
+        self.notebook = ttk.Notebook(nb_container)
+        self.notebook.pack(fill="both", expand=True)
         self._build_iv_tab()
         self._build_it_tab()
         self._build_vt_tab()
@@ -1044,13 +1092,13 @@ class App:
         self._build_pt_tab()
         self._build_ofr_tab()
 
-        log_frame = ttk.Labelframe(left_col, text="日志", padding=6)
-        log_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        log_frame = ttk.Labelframe(log_container, text="日志", padding=6)
+        log_frame.pack(fill="both", expand=True)
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
         ttk.Label(log_frame, text="输出:").grid(row=0, column=0, sticky="w")
-        self.log_text = tk.Text(log_frame, height=10, wrap="word")
+        self.log_text = tk.Text(log_frame, height=8, wrap="word")
         self.log_text.grid(row=1, column=0, sticky="nsew")
 
         chart_frame = ttk.Labelframe(mid_lf, text="实时曲线", padding=6)
@@ -1144,24 +1192,31 @@ class App:
             variable=self.buffer_mode_var,
         )
         chk.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self._bind_help(
+            chk,
+            "缓存模式：使用仪器内部 buffer 批量采集再一次性读回。\n"
+            "优点：更快、更稳定；限制：部分模式/不限时采集可能会回退逐点。",
+            title="缓存模式",
+        )
         return row + 1
 
     def _add_low_current_controls(self, parent, row):
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
+        chk = ttk.Checkbutton(
             frame,
             text="低电流加速模式（更快/更噪）",
             variable=self.low_current_speed_mode_var,
             command=self._on_low_current_toggle,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            frame,
-            text="启用后会关闭/限制自动量程、AutoZero/平均滤波，并偏向更小 NPLC，\n可能降低稳定性/精度。",
-            foreground="#666",
-            wraplength=320,
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        )
+        chk.grid(row=0, column=0, sticky="w")
+
+        help_text = (
+            "启用后会关闭/限制自动量程，关闭 AutoZero/平均滤波，"
+            "并偏向更小 NPLC（更快）。\n"
+            "代价：更容易抖动、更噪，稳定性/精度可能下降。"
+        )
+        self._bind_help(chk, help_text, title="低电流加速模式")
 
         range_frame = ttk.Frame(parent)
         range_frame.grid(row=row + 1, column=0, columnspan=4, sticky="w")
@@ -1256,11 +1311,17 @@ class App:
         ttk.Entry(inner, textvariable=self.iv_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Checkbutton(
+        self.iv_backforth_chk = ttk.Checkbutton(
             inner,
             text="起点-终点-起点（三角扫描）",
             variable=self.iv_backforth_var,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        )
+        self.iv_backforth_chk.grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        self._bind_help(
+            self.iv_backforth_chk,
+            "开启后会按照起点-终点-起点进行扫描，形成三角波式往返。",
+            title="三角扫描",
+        )
         row += 1
 
         self.iv_triangle_from_zero_chk = ttk.Checkbutton(
@@ -1270,6 +1331,11 @@ class App:
             command=self._on_triangle_from_zero_toggle,
         )
         self.iv_triangle_from_zero_chk.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        self._bind_help(
+            self.iv_triangle_from_zero_chk,
+            "三角扫描改为从 0 开始，经过终点再返回起点与 0，便于正负对称扫描。",
+            title="三角扫描",
+        )
         row += 1
 
         self.iv_backforth_var.trace_add("write", lambda *args: self._sync_triangle_from_zero_state())
@@ -2867,6 +2933,18 @@ class App:
         return self._apply_pressure_integration(pressure)
 
     # ---- 日志 & 退出 ----
+
+    def _bind_help(self, widget, help_text: str, title="说明"):
+        SimpleToolTip(widget, help_text)
+
+        def _to_log(_=None):
+            try:
+                self._log(f"[{title}] {help_text.replace(chr(10), ' ')}")
+            except Exception:
+                pass
+
+        widget.bind("<Button-3>", _to_log, add="+")
+        widget.bind("<Control-Button-1>", _to_log, add="+")
 
     def _log(self, msg):
         ts = time.strftime("%H:%M:%S")
