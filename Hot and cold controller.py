@@ -2903,8 +2903,8 @@ class App:
             temp_raw = last_temp_raw
             if getattr(self, "_sampler_tcm", None):
                 val_t, _, ok_t, done_tok = self._sampler_tcm.latest()
-                if done_tok == token and ok_t:
-                    temp_raw = val_t
+                if done_tok >= token and ok_t and (val_t is not None):
+                    temp_raw = float(val_t)
                     last_temp_raw = temp_raw
                     no_temp_count = 0
                 else:
@@ -3193,9 +3193,20 @@ class App:
                 (self._last_veq if hasattr(self, "_last_veq") else getattr(self, "pump_last_vset", 0.0))
             )
 
+            # --- publish temp for UI: keep last valid value to avoid 0.0 flicker ---
+            if not hasattr(self, "_last_temp_pub"):
+                self._last_temp_pub = float("nan")
+
+            temp_valid = (temp_filt is not None) and (temp_filt == temp_filt)
+            if temp_valid:
+                self._last_temp_pub = float(temp_filt)
+
+            # 如果从未有过有效温度，就先给 0.0（或你想要的默认值）
+            temp_pub = self._last_temp_pub if (self._last_temp_pub == self._last_temp_pub) else 0.0
+
             with self.rt_lock:
                 self.rt.update({
-                    "temp": 0.0 if temp_filt is None or not (temp_filt == temp_filt) else float(temp_filt),
+                    "temp": float(temp_pub),
                     "v_out": float(v_out),
                     "a_out": float(a_out),
                     "p_out": float(p_out),
