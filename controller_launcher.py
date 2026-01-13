@@ -44,11 +44,25 @@ class UnifiedController(ttk.Window):
         self.title("冷热压力一体化控制台")
         self.geometry("1720x980")
 
+        self._log_visible = True
+
+        toolbar = ttk.Frame(self, padding=(8, 4))
+        toolbar.pack(fill=tk.X)
+        self.toggle_log_btn = ttk.Button(
+            toolbar,
+            text="隐藏日志",
+            command=self.toggle_log_panel,
+            bootstyle="secondary",
+        )
+        self.toggle_log_btn.pack(side=tk.RIGHT)
+
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
+        self.paned = paned
 
         left_panel = ttk.Frame(paned)
         right_panel = ttk.Labelframe(paned, text="日志", padding=8)
+        self.right_panel = right_panel
 
         paned.add(left_panel, weight=6)
         paned.add(right_panel, weight=1)
@@ -93,6 +107,20 @@ class UnifiedController(ttk.Window):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._maximize_window)
+
+    def toggle_log_panel(self) -> None:
+        if self._log_visible:
+            try:
+                self.paned.forget(self.right_panel)
+            except Exception:
+                return
+            self._log_visible = False
+            self.toggle_log_btn.config(text="显示日志")
+            return
+
+        self.paned.add(self.right_panel, weight=1)
+        self._log_visible = True
+        self.toggle_log_btn.config(text="隐藏日志")
 
     def append_log(self, message: str) -> None:
         if threading.current_thread() is not threading.main_thread():
