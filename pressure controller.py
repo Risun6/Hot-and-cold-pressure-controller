@@ -246,6 +246,10 @@ class MultiPressureRunner(threading.Thread):
             self.app.multi_pressure_running = False
             if self.app.multi_pressure_runner is self:
                 self.app.multi_pressure_runner = None
+            try:
+                self.app.call_in_ui(self.app._refresh_multi_pressure_button_states)
+            except Exception:
+                pass
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -1540,6 +1544,67 @@ class App(ttk.Frame):
                                             state="disabled", bootstyle="danger")
         self.stop_pressure_btn.pack(side=tk.LEFT, padx=10)
 
+        # ===== 压力序列（源表联动） =====
+        sequence_frame = ttk.Labelframe(self.scrollable_frame, text="压力序列（源表联动）")
+        sequence_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        seq_row1 = ttk.Frame(sequence_frame)
+        seq_row1.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(seq_row1, text="压力序列(g):").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(seq_row1, textvariable=self.pressure_points_var, width=32).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_row1, text="逗号分隔").pack(side=tk.LEFT, padx=4)
+
+        seq_row2 = ttk.Frame(sequence_frame)
+        seq_row2.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(seq_row2, text="循环模式:").pack(side=tk.LEFT, padx=4)
+        loop_combo = ttk.Combobox(seq_row2, textvariable=self.loop_mode_var, width=10, state="readonly")
+        loop_combo["values"] = ("顺序", "倒序", "顺序+倒序")
+        loop_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_row2, text="循环次数:").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(seq_row2, textvariable=self.loop_count_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_row2, text="(>=1)").pack(side=tk.LEFT, padx=4)
+
+        seq_row3 = ttk.Frame(sequence_frame)
+        seq_row3.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(seq_row3, text="判稳时间(s):").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(seq_row3, textvariable=self.stable_time_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_row3, text="保压间隔(s):").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(seq_row3, textvariable=self.pressure_step_interval_var, width=8).pack(side=tk.LEFT, padx=4)
+
+        seq_row4 = ttk.Frame(sequence_frame)
+        seq_row4.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(seq_row4, text="源表 TCP 主机:").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(seq_row4, textvariable=self.multi_tcp_host_var, width=12).pack(side=tk.LEFT, padx=4)
+        ttk.Label(seq_row4, text="端口:").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(seq_row4, textvariable=self.multi_tcp_port_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Button(seq_row4, text="测试主机", command=self.test_multi_pressure_host, bootstyle="outline-secondary").pack(
+            side=tk.LEFT, padx=6
+        )
+
+        seq_row5 = ttk.Frame(sequence_frame)
+        seq_row5.pack(fill=tk.X, padx=5, pady=6)
+        self.multi_pressure_start_btn = ttk.Button(
+            seq_row5,
+            text="启动压力序列",
+            command=self.start_multi_pressure_test,
+            state="disabled",
+            bootstyle="success",
+        )
+        self.multi_pressure_start_btn.pack(side=tk.LEFT, padx=4)
+        self.multi_pressure_stop_btn = ttk.Button(
+            seq_row5,
+            text="停止压力序列",
+            command=self.stop_multi_pressure_test,
+            state="disabled",
+            bootstyle="danger",
+        )
+        self.multi_pressure_stop_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            seq_row5,
+            text="序列运行时会向源表发送 start/pressure/run 指令并等待 next",
+            bootstyle="secondary",
+        ).pack(side=tk.LEFT, padx=8)
+
         # —— 开关比测试（OFR） ——
         ofr_frame = ttk.Labelframe(self.scrollable_frame, text="开关比测试（OFR）")
         ofr_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -2261,6 +2326,7 @@ class App(ttk.Frame):
         )
         self.multi_pressure_runner.start()
         self.log(f"启动多压力测试: {points}  循环次数={loop_count}  判稳={stable_time}s")
+        self._refresh_multi_pressure_button_states()
 
     def precise_pressure_control(self, target, tolerance, timeout=60.0):
         self.log(f"开始精准控制压力到: {target}g")
@@ -4836,6 +4902,21 @@ class App(ttk.Frame):
             start_btn.config(state="disabled")
             stop_btn.config(state="disabled")
 
+    def _refresh_multi_pressure_button_states(self) -> None:
+        start_btn = getattr(self, "multi_pressure_start_btn", None)
+        stop_btn = getattr(self, "multi_pressure_stop_btn", None)
+        if not start_btn or not stop_btn:
+            return
+
+        connected = self.sensor_connected and self.controller_connected
+        if not connected:
+            start_btn.config(state="disabled")
+            stop_btn.config(state="disabled")
+            return
+
+        start_btn.config(state="disabled" if self.multi_pressure_running else "normal")
+        stop_btn.config(state="normal" if self.multi_pressure_running else "disabled")
+
     def _refresh_pressure_button_states(self):
         try:
             self.call_in_ui(self.update_button_states)
@@ -4854,6 +4935,7 @@ class App(ttk.Frame):
             if btn is not None:
                 btn.config(state=state)
         self._refresh_pressure_button_states()
+        self._refresh_multi_pressure_button_states()
 
     def shutdown(self, destroy_window: Optional[bool] = None):
         """统一的关闭流程：可在嵌入/独立模式中复用。"""
@@ -5032,6 +5114,7 @@ class App(ttk.Frame):
         self.sim_click_enabled.set(False)
         self.pixel_log_enabled.set(False)
         self.pixel_changes_to_discard = 0
+        self._refresh_multi_pressure_button_states()
 
     def _get_click_times(self, var: tk.Variable, fallback: int = 1) -> int:
         try:
