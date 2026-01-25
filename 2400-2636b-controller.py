@@ -1444,6 +1444,7 @@ class App:
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
         self.iv_rate_tool_enabled_var = tk.BooleanVar(value=False)
         self.iv_rate_cycles_var = tk.IntVar(value=int(self.iv_cycles_var.get() or 1))
+        self.iv_rate_total_cycles_var = tk.StringVar(value="总圈数(自动): -")
         self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
@@ -1488,39 +1489,41 @@ class App:
         ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         self.iv_delay_entry = ttk.Entry(inner, textvariable=self.iv_delay_var, width=10)
         self.iv_delay_entry.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="扫描速率(mV/s):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        self.iv_scan_rate_entry = ttk.Entry(inner, textvariable=self.iv_scan_rate_var, width=10)
-        self.iv_scan_rate_entry.grid(row=row, column=3, sticky="w", pady=4)
+        rate_lock_frame = ttk.Frame(inner)
+        rate_lock_frame.grid(row=row, column=2, columnspan=2, sticky="w", pady=4)
+        ttk.Label(rate_lock_frame, text="扫描速率(mV/s):").grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.iv_scan_rate_entry = ttk.Entry(rate_lock_frame, textvariable=self.iv_scan_rate_var, width=10)
+        self.iv_scan_rate_entry.grid(row=0, column=1, sticky="w")
+        ttk.Label(rate_lock_frame, text="联动锁定:").grid(row=0, column=2, sticky="e", padx=(10, 4))
+        lock_combo = ttk.Combobox(
+            rate_lock_frame,
+            textvariable=self.iv_rate_lock_var,
+            values=["锁定点数", "锁定点间隔", "锁定扫描速率"],
+            state="readonly",
+            width=12,
+        )
+        lock_combo.grid(row=0, column=3, sticky="w")
+        SimpleToolTip(lock_combo, "锁定项保持不变，另两项自动换算")
         row += 1
 
         ttk.Label(inner, text="圈间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="联动锁定:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        lock_combo = ttk.Combobox(
-            inner,
-            textvariable=self.iv_rate_lock_var,
-            values=["锁定点数", "锁定点间隔", "锁定扫描速率"],
-            state="readonly",
-            width=16,
-        )
-        lock_combo.grid(row=row, column=3, sticky="w", pady=4)
-        SimpleToolTip(lock_combo, "锁定项保持不变，另两项自动换算")
         row += 1
 
-        ttk.Button(inner, text="打开速率工具...", command=self._open_iv_rate_tool).grid(
-            row=row,
+        rate_tool_frame = ttk.Frame(inner)
+        rate_tool_frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Button(rate_tool_frame, text="打开速率工具...", command=self._open_iv_rate_tool).grid(
+            row=0,
             column=0,
-            columnspan=2,
             sticky="w",
-            pady=(0, 6),
         )
         self.iv_rate_tool_enable_chk = ttk.Checkbutton(
-            inner,
+            rate_tool_frame,
             text="启用速率序列工具",
             variable=self.iv_rate_tool_enabled_var,
             command=self._sync_iv_rate_tool_state,
         )
-        self.iv_rate_tool_enable_chk.grid(row=row, column=2, columnspan=2, sticky="w", pady=(2, 6))
+        self.iv_rate_tool_enable_chk.grid(row=0, column=1, sticky="w", padx=(12, 0))
         row += 1
 
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
@@ -1674,8 +1677,9 @@ class App:
         self.tools_scroll_canvas = getattr(container, "scroll_canvas", None)
         container.pack(fill="both", expand=True)
 
-        inner_frame.columnconfigure(0, weight=0)
-        inner_frame.columnconfigure(1, weight=1)
+        inner_frame.columnconfigure(0, weight=1, uniform="tools")
+        inner_frame.columnconfigure(1, weight=1, uniform="tools")
+        inner_frame.rowconfigure(0, weight=1)
 
         left = ttk.Labelframe(inner_frame, text="序列扫圈（扫描速率序列）", padding=8)
         right = ttk.Labelframe(inner_frame, text="IV 扫描换算/速率", padding=8)
@@ -1707,13 +1711,16 @@ class App:
         ttk.Button(btn_frame, text="下移", command=lambda: move_rate(1)).grid(row=0, column=2, padx=4)
         ttk.Button(btn_frame, text="清空", command=lambda: clear_rates()).grid(row=0, column=3, padx=4)
 
-        ttk.Checkbutton(
+        self.iv_rate_seq_repeat_chk = ttk.Checkbutton(
             parent,
             text="序列不足时循环",
             variable=self.iv_rate_seq_repeat_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        )
+        self.iv_rate_seq_repeat_chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        ttk.Label(parent, text="扫描周期次数:").grid(row=4, column=0, sticky="e", pady=(2, 0), padx=(0, 4))
+        ttk.Label(parent, text="序列周期次数（完整序列重复次数）:").grid(
+            row=4, column=0, sticky="e", pady=(2, 0), padx=(0, 4)
+        )
         ttk.Entry(parent, textvariable=self.iv_rate_cycles_var, width=12).grid(
             row=4,
             column=1,
@@ -1721,8 +1728,12 @@ class App:
             pady=(2, 0),
         )
 
+        ttk.Label(parent, textvariable=self.iv_rate_total_cycles_var, justify="left").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
         mode_frame = ttk.Labelframe(parent, text="扫描模式", padding=8)
-        mode_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        mode_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
 
         def _cycles_var_for_mode():
             if getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get():
@@ -1783,6 +1794,7 @@ class App:
             listbox.delete(0, tk.END)
             for rate in get_rates():
                 listbox.insert(tk.END, f"{rate:g}")
+            self._refresh_rate_tool_total_cycles()
 
         def add_rate():
             try:
@@ -1892,6 +1904,22 @@ class App:
             if val > 0:
                 rates.append(val)
         return rates
+
+    def _calc_rate_tool_total_cycles(self):
+        enabled = bool(
+            getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get()
+        )
+        if not enabled:
+            return None
+        try:
+            periods = max(1, int(self.iv_rate_cycles_var.get()))
+        except Exception:
+            periods = 1
+        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get())
+        seq_len_raw = len(rate_seq)
+        seq_len = max(1, seq_len_raw)
+        total_cycles = periods * seq_len
+        return total_cycles, periods, seq_len_raw
 
     def _open_iv_rate_tool(self):
         target = getattr(self, "tools_tab_frame", None)
@@ -2010,31 +2038,61 @@ class App:
         enabled = bool(
             getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get()
         )
+        prev_enabled = getattr(self, "_iv_rate_tool_prev_enabled", False)
+        if enabled and not prev_enabled:
+            self._iv_manual_cycles_backup = int(self.iv_cycles_var.get() or 1)
+        if not enabled and prev_enabled:
+            if hasattr(self, "_iv_manual_cycles_backup"):
+                self.iv_cycles_var.set(self._iv_manual_cycles_backup)
         if getattr(self, "iv_cycles_entry", None) is not None:
             try:
                 self.iv_cycles_entry.configure(state="disabled" if enabled else "normal")
             except Exception:
                 pass
-        if enabled:
+        if getattr(self, "iv_rate_seq_repeat_chk", None) is not None:
             try:
-                v = int(self.iv_rate_cycles_var.get())
-                if v > 0:
-                    self.iv_cycles_var.set(v)
+                self.iv_rate_seq_repeat_chk.configure(state="disabled" if enabled else "normal")
             except Exception:
                 pass
+        if enabled:
+            self.iv_rate_seq_repeat_var.set(True)
+            calc = self._calc_rate_tool_total_cycles()
+            if calc:
+                total_cycles, _, _ = calc
+                self.iv_cycles_var.set(total_cycles)
+        else:
+            self.iv_rate_seq_repeat_var.set(False)
+        self._refresh_rate_tool_total_cycles()
+        self._iv_rate_tool_prev_enabled = enabled
 
     def _on_iv_rate_cycles_change(self):
         if not (
             getattr(self, "iv_rate_tool_enabled_var", None)
             and self.iv_rate_tool_enabled_var.get()
         ):
+            self._refresh_rate_tool_total_cycles()
             return
-        try:
-            v = int(self.iv_rate_cycles_var.get())
-            if v > 0:
-                self.iv_cycles_var.set(v)
-        except Exception:
-            pass
+        calc = self._calc_rate_tool_total_cycles()
+        if calc:
+            total_cycles, _, _ = calc
+            self.iv_cycles_var.set(total_cycles)
+        self._refresh_rate_tool_total_cycles()
+
+    def _refresh_rate_tool_total_cycles(self):
+        calc = self._calc_rate_tool_total_cycles()
+        if not calc:
+            self.iv_rate_total_cycles_var.set("总圈数(自动): -")
+            return
+        total_cycles, periods, seq_len_raw = calc
+        seq_len_display = max(1, seq_len_raw)
+        self.iv_rate_total_cycles_var.set(
+            f"总圈数(自动) = 周期 × 序列长度({seq_len_display}) = {total_cycles}"
+        )
+        if (
+            getattr(self, "iv_rate_tool_enabled_var", None)
+            and self.iv_rate_tool_enabled_var.get()
+        ):
+            self.iv_cycles_var.set(total_cycles)
 
     def _build_it_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
@@ -2850,7 +2908,11 @@ class App:
                 getattr(self, "iv_rate_tool_enabled_var", None)
                 and self.iv_rate_tool_enabled_var.get()
             )
-            cycles = self.iv_rate_cycles_var.get() if tool_enabled else self.iv_cycles_var.get()
+            if tool_enabled:
+                periods = int(self.iv_rate_cycles_var.get())
+                cycles = max(1, periods)
+            else:
+                cycles = self.iv_cycles_var.get()
             point_delay = self.iv_delay_var.get()
             scan_rate = self.iv_scan_rate_var.get()
             cycle_delay = self.iv_cycle_delay_var.get()
@@ -2868,15 +2930,28 @@ class App:
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
-        if cycles < 1:
-            messagebox.showwarning("输入错误", "扫描周期次数必须 >= 1")
-            return None
+        if tool_enabled:
+            if cycles < 1:
+                messagebox.showwarning("输入错误", "扫描周期次数必须 >= 1")
+                return None
+        else:
+            if cycles < 1:
+                messagebox.showwarning("输入错误", "循环次数/圈数必须 >= 1")
+                return None
         if points < 2:
             messagebox.showwarning("输入错误", "点数至少为 2")
             return None
         if scan_rate < 0:
             messagebox.showwarning("输入错误", "扫描速率不能为负")
             return None
+        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get()) if tool_enabled else []
+        if tool_enabled:
+            seq_len = max(1, len(rate_seq))
+            cycles = max(1, cycles) * seq_len
+            rate_seq_repeat = True
+        else:
+            rate_seq = []
+            rate_seq_repeat = False
         if self.iv_triangle_from_zero_var.get():
             per_cycle = points * 3 - 2 if points > 1 else points
         elif self.iv_backforth_var.get():
@@ -2911,8 +2986,6 @@ class App:
                 pass
         range_mV = abs(stop - start) * 1000.0
         step_mV_effective = range_mV / max(1, points - 1)
-        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get()) if tool_enabled else []
-        rate_seq_repeat = bool(self.iv_rate_seq_repeat_var.get()) if tool_enabled else False
         if scan_rate > 0:
             point_delay_effective = step_mV_effective / scan_rate if step_mV_effective > 0 else 0.0
             self._log(f"按扫描速率换算 point_delay={point_delay_effective:.6g}s")
