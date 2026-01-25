@@ -1425,9 +1425,12 @@ class App:
 
         inner = ttk.Frame(page)
         inner.grid(row=0, column=0, pady=4, sticky="ew")
+        # 0~3 列都不参与“拉伸分配”，避免控件间距被撑大
         for col in range(4):
-            weight = 0 if col in (1, 3) else 1
-            inner.columnconfigure(col, weight=weight)
+            inner.columnconfigure(col, weight=0)
+
+        # 新增一个“空白吸收列”，专门吃掉窗口变宽时多出来的空间
+        inner.columnconfigure(4, weight=1)
 
         self.iv_source_mode_var = tk.StringVar(value="Voltage")
         self.iv_start_var = tk.DoubleVar(value=-1.0)
