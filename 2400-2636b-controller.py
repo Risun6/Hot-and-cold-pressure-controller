@@ -34,6 +34,8 @@ try:
 except Exception:
     pyvisa = None
 
+TOOLS_TAB_TEXT = "速率工具"
+
 
 class SimpleToolTip:
     def __init__(self, widget, text: str, wraplength=360):
@@ -1415,9 +1417,14 @@ class App:
         self.iv_tab_frame = frame
         self.notebook.add(frame, text="IV 扫描")
 
+        frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        inner = ttk.Frame(frame)
-        inner.grid(row=0, column=0, pady=4)
+        container, page = self._make_scrollable(frame)
+        container.grid(row=0, column=0, sticky="nsew")
+        page.columnconfigure(0, weight=1)
+
+        inner = ttk.Frame(page)
+        inner.grid(row=0, column=0, pady=4, sticky="ew")
         for col in range(4):
             weight = 0 if col in (1, 3) else 1
             inner.columnconfigure(col, weight=weight)
@@ -1432,7 +1439,7 @@ class App:
         self.iv_triangle_from_zero_var = tk.BooleanVar(value=False)
         self.iv_delay_var = tk.DoubleVar(value=0.0)
         self.iv_scan_rate_var = tk.DoubleVar(value=0.0)
-        self.iv_rate_lock_var = tk.StringVar(value="固定点数")
+        self.iv_rate_lock_var = tk.StringVar(value="锁定点数")
         self.iv_rate_seq_text = tk.StringVar(value="")
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
         self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
@@ -1485,17 +1492,19 @@ class App:
 
         ttk.Label(inner, text="圈间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="联动优先保持:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        ttk.Combobox(
+        ttk.Label(inner, text="联动锁定:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
+        lock_combo = ttk.Combobox(
             inner,
             textvariable=self.iv_rate_lock_var,
-            values=["固定点数", "固定点间隔", "固定扫描速率"],
+            values=["锁定点数", "锁定点间隔", "锁定扫描速率"],
             state="readonly",
             width=16,
-        ).grid(row=row, column=3, sticky="w", pady=4)
+        )
+        lock_combo.grid(row=row, column=3, sticky="w", pady=4)
+        SimpleToolTip(lock_combo, "锁定项保持不变，另两项自动换算")
         row += 1
 
-        ttk.Button(inner, text="速率工具...", command=self._open_iv_rate_tool).grid(
+        ttk.Button(inner, text="打开速率工具...", command=self._open_iv_rate_tool).grid(
             row=row,
             column=0,
             columnspan=2,
@@ -1541,13 +1550,13 @@ class App:
         row = self._add_low_current_controls(inner, row)
 
         ttk.Checkbutton(
-            frame,
+            page,
             text="启用 IV 质量检测",
             variable=self.iv_quality_enabled_var,
             command=self._toggle_iv_quality_frame,
         ).grid(row=1, column=0, sticky="w", pady=(10, 0))
 
-        adv = ttk.Labelframe(frame, text="IV 质量检测（高级）", padding=6)
+        adv = ttk.Labelframe(page, text="IV 质量检测（高级）", padding=6)
         self.iv_quality_frame = adv
         adv.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         for col in range(2):
@@ -1647,13 +1656,13 @@ class App:
     def _build_tools_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
         self.tools_tab_frame = frame
-        self.notebook.add(frame, text="工具")
+        self.notebook.add(frame, text=TOOLS_TAB_TEXT)
 
         container, inner_frame = self._make_scrollable(frame)
         self.tools_scroll_canvas = getattr(container, "scroll_canvas", None)
         container.pack(fill="both", expand=True)
 
-        inner_frame.columnconfigure(0, weight=1)
+        inner_frame.columnconfigure(0, weight=0)
         inner_frame.columnconfigure(1, weight=1)
 
         left = ttk.Labelframe(inner_frame, text="序列扫圈（扫描速率序列）", padding=8)
@@ -1674,7 +1683,7 @@ class App:
         entry.grid(row=0, column=0, sticky="w")
         ttk.Button(parent, text="添加", command=lambda: add_rate()).grid(row=0, column=1, padx=(6, 0))
 
-        listbox = tk.Listbox(parent, height=8, width=22)
+        listbox = tk.Listbox(parent, height=8, width=18)
         listbox.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=6)
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
@@ -1805,15 +1814,21 @@ class App:
         )
         info_label.grid(row=0, column=0, sticky="ew")
 
+        def _wrap(_event=None):
+            info_label.configure(wraplength=max(240, parent.winfo_width() - 20))
+
+        parent.bind("<Configure>", _wrap, add="+")
+        _wrap()
+
         btn_frame = ttk.Frame(parent)
         btn_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Button(btn_frame, text="按当前 IV 参数刷新显示", command=self._refresh_iv_rate_calc_info).grid(
-            row=0, column=0, sticky="w"
-        )
+        ttk.Button(btn_frame, text="刷新显示", command=self._refresh_iv_rate_calc_info).grid(row=0, column=0, sticky="w")
         if hasattr(self, "iv_tab_frame"):
-            ttk.Button(btn_frame, text="跳转到 IV 扫描页", command=lambda: self.notebook.select(self.iv_tab_frame)).grid(
-                row=0, column=1, padx=(6, 0)
-            )
+            ttk.Button(
+                btn_frame,
+                text="打开 IV 扫描页",
+                command=lambda: self.notebook.select(self.iv_tab_frame),
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._refresh_iv_rate_calc_info()
 
     def _refresh_iv_rate_calc_info(self):
@@ -1857,7 +1872,7 @@ class App:
         target = getattr(self, "tools_tab_frame", None)
         if target is None:
             for tab_id in self.notebook.tabs():
-                if self.notebook.tab(tab_id, "text") == "工具":
+                if self.notebook.tab(tab_id, "text") == TOOLS_TAB_TEXT:
                     target = tab_id
                     break
         if target is not None:
@@ -1895,8 +1910,11 @@ class App:
     def _normalize_iv_lock(self):
         lock = self.iv_rate_lock_var.get()
         mapping = {
+            "锁定点数": "points",
             "固定点数": "points",
+            "锁定点间隔": "point_interval",
             "固定点间隔": "point_interval",
+            "锁定扫描速率": "scan_rate",
             "固定扫描速率": "scan_rate",
         }
         return mapping.get(lock, lock)
