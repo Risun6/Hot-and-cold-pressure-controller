@@ -451,6 +451,29 @@ class KeithleyInstrument:
                 # 不让底层异常直接炸掉上层流程
                 pass
 
+    def set_level_2400(self, mode, level):
+        with self.lock:
+            try:
+                level_val = float(level)
+            except Exception:
+                return
+            self.last_setpoint = level_val
+            if self.simulated or self.session is None:
+                return
+            try:
+                if mode == "Voltage":
+                    self.session.write(f":SOUR:VOLT:LEV {level_val}")
+                else:
+                    self.session.write(f":SOUR:CURR:LEV {level_val}")
+            except Exception:
+                try:
+                    if mode == "Voltage":
+                        self.session.write(f"SOUR:VOLT:LEV {level_val}")
+                    else:
+                        self.session.write(f"SOUR:CURR:LEV {level_val}")
+                except Exception:
+                    pass
+
     def set_remote_sense(self, enable: bool):
         """开启或关闭远端感测（四线制）"""
         with self.lock:
@@ -1001,7 +1024,7 @@ class App:
         self.stream_txt_var = tk.BooleanVar(value=False)             # 实时写入 TXT
         self.stream_flush_interval_var = tk.DoubleVar(value=0.5)     # writer flush(s)
         self.stream_queue_max_var = tk.IntVar(value=20000)           # writer 队列上限
-        self.mem_keep_points_var = tk.IntVar(value=0)                # 内存只保留最近 N 点(0=不限制)
+        self.mem_keep_points_var = tk.IntVar(value=50000)            # 内存只保留最近 N 点(0=不限制)
 
         self.ui_max_items_per_poll_var = tk.IntVar(value=300)        # UI 每次轮询最多处理队列项
 
@@ -1445,6 +1468,8 @@ class App:
         self.iv_rate_lock_var = tk.StringVar(value="锁定点数")
         self.iv_rate_seq_text = tk.StringVar(value="")
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
+        self.iv_rate_timing_mode_var = tk.StringVar(value="by_step")
+        # by_step=固定步长(改点间隔)；by_interval=固定点间隔(改步长/点数)
         self.iv_rate_tool_enabled_var = tk.BooleanVar(value=False)
         self.iv_rate_cycles_var = tk.IntVar(value=int(self.iv_cycles_var.get() or 1))
         self.iv_rate_total_cycles_var = tk.StringVar(value="总圈数(自动): -")
@@ -1737,6 +1762,8 @@ class App:
 
         mode_frame = ttk.Labelframe(parent, text="扫描模式", padding=8)
         mode_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        mode_frame.columnconfigure(0, weight=1)
+        mode_frame.columnconfigure(1, weight=1)
 
         def _cycles_var_for_mode():
             if getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get():
@@ -1785,6 +1812,23 @@ class App:
             value="multi_backforth",
             command=apply_mode,
         ).grid(row=2, column=0, sticky="w", pady=2)
+
+        timing_frame = ttk.Labelframe(mode_frame, text="速率生效方式", padding=6)
+        timing_frame.grid(row=0, column=1, rowspan=3, sticky="nsew", padx=(12, 0))
+        ttk.Radiobutton(
+            timing_frame,
+            text="固定电压步长：按速率计算点间隔",
+            variable=self.iv_rate_timing_mode_var,
+            value="by_step",
+            command=self._refresh_iv_rate_calc_info,
+        ).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(
+            timing_frame,
+            text="固定点间隔：按速率计算步长/点数（计数器）",
+            variable=self.iv_rate_timing_mode_var,
+            value="by_interval",
+            command=self._refresh_iv_rate_calc_info,
+        ).grid(row=1, column=0, sticky="w", pady=2)
 
         def get_rates():
             return self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get())
@@ -2643,10 +2687,14 @@ class App:
         step_mV_effective = cfg.get("step_mV_effective", None)
         levels_from_cfg = cfg.get("levels_one_cycle") if buffer_mode else None
         delay_source = "point_delay" if "point_delay" in cfg else "delay"
+        rate_timing_mode = cfg.get("rate_timing_mode", "by_step")
+        point_interval_s = cfg.get("point_interval_s", point_delay)
+        global_idx = 0
 
         self._log(
-            f"IV timing: point_interval={point_delay}s, scan_rate={scan_rate}mV/s, "
-            f"cycle_interval={cycle_delay}s, cycles={cycles}, buffer_mode={buffer_mode}, source={delay_source}"
+            f"IV timing: point_interval={point_interval_s}s, scan_rate={scan_rate}mV/s, "
+            f"cycle_interval={cycle_delay}s, cycles={cycles}, buffer_mode={buffer_mode}, "
+            f"timing_mode={rate_timing_mode}, source={delay_source}"
         )
         self._log("实际点间隔会叠加测量耗时(NPLC/通讯)，尤其在非缓存模式下")
         self._log(
@@ -2678,98 +2726,178 @@ class App:
             time.sleep(duration)
             return not self.stop_event.is_set()
 
-        if buffer_mode and isinstance(levels_from_cfg, (list, tuple)):
-            one_cycle = list(levels_from_cfg)
-        else:
-            base_forward = self.instrument.sweep_points(start, stop, points)
-            if triangle_from_zero:
-                seg1 = self.instrument.sweep_points(0, stop, points)
-                seg2 = self.instrument.sweep_points(stop, start, points)[1:]
-                seg3 = self.instrument.sweep_points(start, 0, points)[1:]
-                one_cycle = list(np.concatenate([seg1, seg2, seg3]))
-            elif back_and_forth:
-                if len(base_forward) > 1:
-                    backward = base_forward[-2::-1]
-                else:
-                    backward = base_forward
-                one_cycle = list(np.concatenate([base_forward, backward]))
+        def sleep_until(target_t):
+            while True:
+                if self.stop_event.is_set():
+                    return False
+                now = time.perf_counter()
+                rem = target_t - now
+                if rem <= 0:
+                    return True
+                time.sleep(min(0.05, rem))
+
+        if rate_timing_mode != "by_step" and buffer_mode:
+            self._log("固定点间隔模式下不启用缓存模式，已回退逐点采集。")
+            buffer_mode = False
+
+        if rate_timing_mode == "by_step":
+            if buffer_mode and isinstance(levels_from_cfg, (list, tuple)):
+                one_cycle = list(levels_from_cfg)
             else:
-                one_cycle = list(base_forward)
+                base_forward = self.instrument.sweep_points(start, stop, points)
+                if triangle_from_zero:
+                    seg1 = self.instrument.sweep_points(0, stop, points)
+                    seg2 = self.instrument.sweep_points(stop, start, points)[1:]
+                    seg3 = self.instrument.sweep_points(start, 0, points)[1:]
+                    one_cycle = list(np.concatenate([seg1, seg2, seg3]))
+                elif back_and_forth:
+                    if len(base_forward) > 1:
+                        backward = base_forward[-2::-1]
+                    else:
+                        backward = base_forward
+                    one_cycle = list(np.concatenate([base_forward, backward]))
+                else:
+                    one_cycle = list(base_forward)
+            is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
+            if is_2636b:
+                self.instrument.prepare_source_2636(source_mode, compliance)
+
+            if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
+                try:
+                    for cyc in range(cycles):
+                        if self.stop_event.is_set():
+                            break
+                        rate, cycle_point_delay = resolve_point_delay(cyc)
+                        rate_desc = f"{rate:g}" if rate > 0 else "N/A"
+                        self._log(
+                            f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
+                            f"point_delay={cycle_point_delay:.6g}s"
+                        )
+                        if not is_2636b:
+                            self.instrument.configure_source(source_mode, float(one_cycle[0]), compliance)
+                        if is_2636b:
+                            readings = self.instrument.buffer_sweep_2636(
+                                source_mode,
+                                compliance,
+                                one_cycle,
+                                cycle_point_delay,
+                            )
+                        else:
+                            readings = self.instrument.buffer_sweep_2400(
+                                source_mode,
+                                compliance,
+                                one_cycle,
+                                cycle_point_delay,
+                            )
+                        for idx, data in enumerate(readings):
+                            sp = float(one_cycle[idx]) if idx < len(one_cycle) else 0.0
+                            data.update({"index": global_idx, "setpoint": sp, "cycle": cyc + 1})
+                            data["scan_rate_mVps"] = rate if rate > 0 else ""
+                            data["mode"] = "IV"
+                            # 实时写入：绝不阻塞
+                            self._stream_submit(data)
+                            self.queue.put(("data", data, self.total_points))
+                            global_idx += 1
+                        if cyc < cycles - 1 and cycle_delay > 0:
+                            if not sleep_with_stop(cycle_delay):
+                                break
+                    return
+                except Exception as exc:
+                    self._log(f"缓存模式失败，回退到逐点: {exc}")
+
+            for cyc in range(cycles):
+                if self.stop_event.is_set():
+                    break
+                rate, cycle_point_delay = resolve_point_delay(cyc)
+                rate_desc = f"{rate:g}" if rate > 0 else "N/A"
+                self._log(
+                    f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
+                    f"point_delay={cycle_point_delay:.6g}s"
+                )
+                if not is_2636b:
+                    self.instrument.configure_source(source_mode, float(one_cycle[0]), compliance)
+                cycle_start = time.perf_counter()
+                for idx_in_cycle, level in enumerate(one_cycle):
+                    if self.stop_event.is_set():
+                        break
+                    if is_2636b:
+                        self.instrument.set_level_2636(source_mode, float(level))
+                    else:
+                        self.instrument.set_level_2400(source_mode, float(level))
+                    if cycle_point_delay and cycle_point_delay > 0:
+                        if not sleep_with_stop(cycle_point_delay):
+                            break
+                    data = self.instrument.measure_once()
+                    data.update({"index": global_idx, "setpoint": float(level), "cycle": cyc + 1})
+                    data["scan_rate_mVps"] = rate if rate > 0 else ""
+                    data["mode"] = "IV"
+                    # 实时写入：绝不阻塞
+                    self._stream_submit(data)
+                    self.queue.put(("data", data, self.total_points))
+                    global_idx += 1
+                if self.stop_event.is_set():
+                    break
+                cycle_elapsed = time.perf_counter() - cycle_start
+                if one_cycle:
+                    avg_per_point = cycle_elapsed / len(one_cycle)
+                    self._log(
+                        f"Cycle {cyc + 1} done: points={len(one_cycle)}, "
+                        f"elapsed={cycle_elapsed:.3f}s, avg/pt={avg_per_point:.6f}s"
+                    )
+                if cyc < cycles - 1 and cycle_delay > 0:
+                    if not sleep_with_stop(cycle_delay):
+                        break
+            return
+
         is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
         if is_2636b:
             self.instrument.prepare_source_2636(source_mode, compliance)
-        else:
-            self.instrument.configure_source(source_mode, float(one_cycle[0]), compliance)
-
-        if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
-            try:
-                for cyc in range(cycles):
-                    if self.stop_event.is_set():
-                        break
-                    rate, cycle_point_delay = resolve_point_delay(cyc)
-                    rate_desc = f"{rate:g}" if rate > 0 else "N/A"
-                    self._log(
-                        f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
-                        f"point_delay={cycle_point_delay:.6g}s"
-                    )
-                    if is_2636b:
-                        readings = self.instrument.buffer_sweep_2636(
-                            source_mode,
-                            compliance,
-                            one_cycle,
-                            cycle_point_delay,
-                        )
-                    else:
-                        readings = self.instrument.buffer_sweep_2400(
-                            source_mode,
-                            compliance,
-                            one_cycle,
-                            cycle_point_delay,
-                        )
-                    for idx, data in enumerate(readings):
-                        sp = float(one_cycle[idx]) if idx < len(one_cycle) else 0.0
-                        global_idx = cyc * len(one_cycle) + idx
-                        data.update({"index": global_idx, "setpoint": sp, "cycle": cyc + 1})
-                        data["scan_rate_mVps"] = rate if rate > 0 else ""
-                        data["mode"] = "IV"
-                        # 实时写入：绝不阻塞
-                        self._stream_submit(data)
-                        self.queue.put(("data", data, self.total_points))
-                    if cyc < cycles - 1 and cycle_delay > 0:
-                        if not sleep_with_stop(cycle_delay):
-                            break
-                return
-            except Exception as exc:
-                self._log(f"缓存模式失败，回退到逐点: {exc}")
 
         for cyc in range(cycles):
             if self.stop_event.is_set():
                 break
-            rate, cycle_point_delay = resolve_point_delay(cyc)
+            rate = pick_cycle_rate(cyc)
+            try:
+                dt = float(point_interval_s)
+            except Exception:
+                dt = 0.0
+            if dt < 0:
+                dt = 0.0
+            step_v = (rate * dt) / 1000.0 if rate > 0 and dt > 0 else 0.0
+            one_cycle = self._build_iv_levels_by_step(
+                start,
+                stop,
+                step_v,
+                back_and_forth,
+                triangle_from_zero,
+            )
             rate_desc = f"{rate:g}" if rate > 0 else "N/A"
             self._log(
                 f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
-                f"point_delay={cycle_point_delay:.6g}s"
+                f"point_interval={dt:.6g}s, step={step_v:.6g}V"
             )
-            cycle_start = time.perf_counter()
+            if not is_2636b:
+                first_level = float(one_cycle[0]) if one_cycle else float(start)
+                self.instrument.configure_source(source_mode, first_level, compliance)
+            t0 = time.perf_counter()
+            cycle_start = t0
             for idx_in_cycle, level in enumerate(one_cycle):
                 if self.stop_event.is_set():
+                    break
+                if not sleep_until(t0 + idx_in_cycle * dt):
                     break
                 if is_2636b:
                     self.instrument.set_level_2636(source_mode, float(level))
                 else:
-                    self.instrument.configure_source(source_mode, float(level), compliance)
-                if cycle_point_delay and cycle_point_delay > 0:
-                    if not sleep_with_stop(cycle_point_delay):
-                        break
+                    self.instrument.set_level_2400(source_mode, float(level))
                 data = self.instrument.measure_once()
-                global_idx = cyc * len(one_cycle) + idx_in_cycle
                 data.update({"index": global_idx, "setpoint": float(level), "cycle": cyc + 1})
                 data["scan_rate_mVps"] = rate if rate > 0 else ""
                 data["mode"] = "IV"
                 # 实时写入：绝不阻塞
                 self._stream_submit(data)
                 self.queue.put(("data", data, self.total_points))
+                global_idx += 1
             if self.stop_event.is_set():
                 break
             cycle_elapsed = time.perf_counter() - cycle_start
@@ -2901,6 +3029,48 @@ class App:
             seq.extend(segment)
         return seq
 
+    def _build_iv_levels_by_step(self, start, stop, step_v, back_and_forth, triangle_from_zero):
+        """按电压步长生成一圈 setpoint（用于固定点间隔/计数器模式）"""
+
+        def _segment(a, b, step_abs):
+            a = float(a)
+            b = float(b)
+            step_abs = abs(float(step_abs))
+            if step_abs <= 0:
+                return [a, b] if a != b else [a]
+
+            direction = 1.0 if b >= a else -1.0
+            step = step_abs * direction
+            out = []
+            v = a
+            guard = 0
+            max_points = 200000
+            eps = max(1e-12, step_abs * 1e-9)
+
+            while guard < max_points:
+                out.append(v)
+                if (direction > 0 and v >= b - eps) or (direction < 0 and v <= b + eps):
+                    break
+                v = v + step
+                guard += 1
+
+            if abs(out[-1] - b) > eps:
+                out.append(b)
+            return out
+
+        step_abs = abs(float(step_v)) if step_v else 0.0
+
+        if triangle_from_zero:
+            seg1 = _segment(0.0, stop, step_abs)
+            seg2 = _segment(stop, start, step_abs)[1:]
+            seg3 = _segment(start, 0.0, step_abs)[1:]
+            return seg1 + seg2 + seg3
+
+        base = _segment(start, stop, step_abs)
+        if back_and_forth and len(base) > 1:
+            return base + base[-2::-1]
+        return base
+
     def _collect_iv_config(self):
         try:
             start = self.iv_start_var.get()
@@ -2921,6 +3091,7 @@ class App:
             cycle_delay = self.iv_cycle_delay_var.get()
             compliance = self.iv_compliance_var.get()
             source_mode = self.iv_source_mode_var.get()
+            rate_timing_mode = self.iv_rate_timing_mode_var.get()
         except tk.TclError:
             messagebox.showwarning("输入错误", "IV 参数无效")
             return None
@@ -2989,7 +3160,7 @@ class App:
                 pass
         range_mV = abs(stop - start) * 1000.0
         step_mV_effective = range_mV / max(1, points - 1)
-        if scan_rate > 0:
+        if scan_rate > 0 and rate_timing_mode == "by_step":
             point_delay_effective = step_mV_effective / scan_rate if step_mV_effective > 0 else 0.0
             self._log(f"按扫描速率换算 point_delay={point_delay_effective:.6g}s")
             point_delay = point_delay_effective
@@ -3003,12 +3174,14 @@ class App:
             triangle_from_zero=triangle_from_zero,
             delay=point_delay,
             point_delay=point_delay,
+            point_interval_s=point_delay,
             cycle_delay=cycle_delay,
             per_cycle=per_cycle,
             step_mV_effective=step_mV_effective,
             scan_rate_mVps=scan_rate,
             rate_seq_mVps=rate_seq,
             rate_seq_repeat=rate_seq_repeat,
+            rate_timing_mode=rate_timing_mode,
             compliance=compliance,
             source_mode="Voltage" if source_mode == "Voltage" else "Current",
             total_points=total_points,
@@ -3199,7 +3372,7 @@ class App:
             pass
 
         # 队列还很多就尽快再跑一次，否则放慢点
-        delay_ms = 1 if processed >= max_items else 50
+        delay_ms = 5 if processed >= max_items else 50
         self.root.after(delay_ms, self._poll_queue)
 
     def _format_seconds(self, sec: int) -> str:
