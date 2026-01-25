@@ -3614,7 +3614,7 @@ class App:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            filetypes=[("TSV (*.txt)", "*.txt"), ("CSV (*.csv)", "*.csv"), ("All files", "*.*")],
         )
         if not path:
             return
@@ -3703,18 +3703,31 @@ class App:
             self._log(f"实时写入已结束：{path}（丢弃 {dropped} 条）")
 
     def _save_data_to_csv(self, path, *, extra_comments=None):
-        keys = ["index", "timestamp", "setpoint", "voltage", "current", "resistance", "power"]
-        with open(path, "w", newline="") as f:
+        # 兼容导出为 CSV 或 TXT/TSV：.txt/.tsv 用制表符分隔，其它默认逗号
+        ext = os.path.splitext(path)[1].lower()
+        is_tsv = ext in (".txt", ".tsv")
+        sep = "\t" if is_tsv else ","
+
+        # 与实时写入保持一致：把 scan_rate_mVps 也导出
+        keys = [
+            "timestamp", "index", "cycle", "mode", "setpoint",
+            "scan_rate_mVps", "voltage", "current", "resistance", "power", "pressure",
+        ]
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
             mode = self.current_mode or ""
             wiring = "4-wire" if getattr(self, "four_wire_var", tk.BooleanVar(value=False)).get() else "2-wire"
+
             comments = [f"# mode: {mode}"]
             if extra_comments:
                 comments.extend(extra_comments)
             comments.append(f"# wiring: {wiring}")
+            comments.append(f"# format: {'tsv' if is_tsv else 'csv'}")
+
             for line in comments:
                 f.write(f"{line}\n")
 
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=keys, delimiter=sep)
             writer.writeheader()
             for row in self.current_data:
                 writer.writerow({k: row.get(k, "") for k in keys})
