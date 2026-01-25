@@ -1429,6 +1429,10 @@ class App:
         self.iv_backforth_var = tk.BooleanVar(value=False)
         self.iv_triangle_from_zero_var = tk.BooleanVar(value=False)
         self.iv_delay_var = tk.DoubleVar(value=0.0)
+        self.iv_scan_rate_var = tk.DoubleVar(value=0.0)
+        self.iv_rate_lock_var = tk.StringVar(value="points")
+        self.iv_rate_seq_text = tk.StringVar(value="")
+        self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
         self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
@@ -1437,6 +1441,7 @@ class App:
         self.iv_quality_max_retry_var = tk.IntVar(value=2)
         self.iv_quality_enabled_var = tk.BooleanVar(value=False)
         self._iv_updating = False
+        self._iv_sync_guard = False
 
         row = 0
         row = self._add_buffer_mode_control(inner, row)
@@ -1468,10 +1473,31 @@ class App:
         points_entry.grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.iv_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="圈间隔 (s):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        ttk.Label(inner, text="扫描速率(mV/s):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
+        ttk.Entry(inner, textvariable=self.iv_scan_rate_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        row += 1
+
+        ttk.Label(inner, text="圈间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
+        ttk.Label(inner, text="锁定:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
+        ttk.Combobox(
+            inner,
+            textvariable=self.iv_rate_lock_var,
+            values=["points", "point_interval", "scan_rate"],
+            state="readonly",
+            width=16,
+        ).grid(row=row, column=3, sticky="w", pady=4)
+        row += 1
+
+        ttk.Button(inner, text="速率工具...", command=self._open_iv_rate_tool).grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 6),
+        )
         row += 1
 
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
@@ -1540,8 +1566,19 @@ class App:
         # 步长 / 点数 联动
         step_entry.bind("<FocusOut>", lambda e: self._update_points_from_step())
         points_entry.bind("<FocusOut>", lambda e: self._update_step_from_points())
-        for var in (self.iv_start_var, self.iv_stop_var):
-            var.trace_add("write", lambda *args: self._update_points_from_step())
+        for var, changed in (
+            (self.iv_start_var, "range"),
+            (self.iv_stop_var, "range"),
+            (self.iv_step_var, "step"),
+            (self.iv_points_var, "points"),
+            (self.iv_delay_var, "delay"),
+            (self.iv_scan_rate_var, "rate"),
+        ):
+            var.trace_add("write", lambda *args, ch=changed: self._iv_sync_rate_delay_points(ch))
+        self.iv_rate_lock_var.trace_add(
+            "write",
+            lambda *args: self._iv_sync_rate_delay_points("points"),
+        )
 
     def _toggle_iv_quality_frame(self):
         if self.iv_quality_enabled_var.get():
@@ -1566,43 +1603,229 @@ class App:
         except Exception:
             pass
 
+    def _parse_iv_rate_seq_text(self, text):
+        rates = []
+        for part in (text or "").split(","):
+            item = part.strip()
+            if not item:
+                continue
+            try:
+                val = float(item)
+            except Exception:
+                continue
+            if val > 0:
+                rates.append(val)
+        return rates
+
+    def _open_iv_rate_tool(self):
+        win = tk.Toplevel(self.root)
+        win.title("IV 扫描速率工具")
+        win.transient(self.root)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        win.rowconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+
+        seq_frame = ttk.Labelframe(frame, text="速率序列(mV/s)", padding=8)
+        seq_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        entry_var = tk.StringVar(value="")
+        entry = ttk.Entry(seq_frame, textvariable=entry_var, width=12)
+        entry.grid(row=0, column=0, sticky="w")
+        ttk.Button(seq_frame, text="添加", command=lambda: add_rate()).grid(row=0, column=1, padx=(6, 0))
+
+        listbox = tk.Listbox(seq_frame, height=8, width=22)
+        listbox.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=6)
+        seq_frame.rowconfigure(1, weight=1)
+        seq_frame.columnconfigure(0, weight=1)
+
+        btn_frame = ttk.Frame(seq_frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(btn_frame, text="删除", command=lambda: remove_rate()).grid(row=0, column=0)
+        ttk.Button(btn_frame, text="上移", command=lambda: move_rate(-1)).grid(row=0, column=1, padx=4)
+        ttk.Button(btn_frame, text="下移", command=lambda: move_rate(1)).grid(row=0, column=2, padx=4)
+        ttk.Button(btn_frame, text="清空", command=lambda: clear_rates()).grid(row=0, column=3, padx=4)
+
+        ttk.Checkbutton(
+            seq_frame,
+            text="序列不足时循环",
+            variable=self.iv_rate_seq_repeat_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        mode_frame = ttk.Labelframe(frame, text="扫描模式", padding=8)
+        mode_frame.grid(row=0, column=1, sticky="nsew")
+
+        mode_var = tk.StringVar(value="multi_forward")
+
+        def infer_mode():
+            if self.iv_cycles_var.get() == 1 and not self.iv_backforth_var.get():
+                return "single_forward"
+            if self.iv_backforth_var.get():
+                return "multi_backforth"
+            return "multi_forward"
+
+        def apply_mode():
+            mode = mode_var.get()
+            if mode == "single_forward":
+                self.iv_cycles_var.set(1)
+                self.iv_backforth_var.set(False)
+                self.iv_triangle_from_zero_var.set(False)
+            elif mode == "multi_forward":
+                self.iv_backforth_var.set(False)
+                self.iv_triangle_from_zero_var.set(False)
+            elif mode == "multi_backforth":
+                self.iv_backforth_var.set(True)
+                self.iv_triangle_from_zero_var.set(False)
+
+        mode_var.set(infer_mode())
+        ttk.Radiobutton(
+            mode_frame,
+            text="单次单方向",
+            variable=mode_var,
+            value="single_forward",
+            command=apply_mode,
+        ).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(
+            mode_frame,
+            text="多次单方向",
+            variable=mode_var,
+            value="multi_forward",
+            command=apply_mode,
+        ).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(
+            mode_frame,
+            text="多次来回",
+            variable=mode_var,
+            value="multi_backforth",
+            command=apply_mode,
+        ).grid(row=2, column=0, sticky="w", pady=2)
+
+        def get_rates():
+            return self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get())
+
+        def sync_text_from_list(rates):
+            text = ", ".join(f"{rate:g}" for rate in rates)
+            self.iv_rate_seq_text.set(text)
+
+        def refresh_list():
+            listbox.delete(0, tk.END)
+            for rate in get_rates():
+                listbox.insert(tk.END, f"{rate:g}")
+
+        def add_rate():
+            try:
+                val = float(entry_var.get())
+            except Exception:
+                return
+            if val <= 0:
+                return
+            rates = get_rates()
+            rates.append(val)
+            sync_text_from_list(rates)
+            refresh_list()
+            entry_var.set("")
+
+        def remove_rate():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            rates = get_rates()
+            if 0 <= idx < len(rates):
+                rates.pop(idx)
+            sync_text_from_list(rates)
+            refresh_list()
+
+        def move_rate(direction):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            rates = get_rates()
+            new_idx = idx + direction
+            if 0 <= idx < len(rates) and 0 <= new_idx < len(rates):
+                rates[idx], rates[new_idx] = rates[new_idx], rates[idx]
+                sync_text_from_list(rates)
+                refresh_list()
+                listbox.selection_set(new_idx)
+
+        def clear_rates():
+            sync_text_from_list([])
+            refresh_list()
+
+        refresh_list()
+
     def _update_points_from_step(self):
-        if self._iv_updating:
-            return
-        try:
-            start = self.iv_start_var.get()
-            stop = self.iv_stop_var.get()
-            step = self.iv_step_var.get()
-        except tk.TclError:
-            return
-        if step <= 0:
-            return
-        n = int(round((stop - start) / step)) + 1
-        if n < 2:
-            n = 2
-        self._iv_updating = True
-        try:
-            self.iv_points_var.set(n)
-        finally:
-            self._iv_updating = False
+        self._iv_sync_rate_delay_points("step")
 
     def _update_step_from_points(self):
-        if self._iv_updating:
+        self._iv_sync_rate_delay_points("points")
+
+    def _iv_sync_rate_delay_points(self, changed: str):
+        if self._iv_sync_guard:
             return
+        self._iv_sync_guard = True
         try:
-            start = self.iv_start_var.get()
-            stop = self.iv_stop_var.get()
-            n = self.iv_points_var.get()
-        except tk.TclError:
-            return
-        if n < 2:
-            n = 2
-        step = (stop - start) / (n - 1)
-        self._iv_updating = True
-        try:
-            self.iv_step_var.set(step)
+            try:
+                start = self.iv_start_var.get()
+                stop = self.iv_stop_var.get()
+                points = int(self.iv_points_var.get())
+                delay = float(self.iv_delay_var.get())
+                rate = float(self.iv_scan_rate_var.get())
+                lock = self.iv_rate_lock_var.get()
+            except tk.TclError:
+                return
+
+            points = max(2, min(200000, points))
+            delay = max(0.0, min(1e6, delay))
+            rate = max(0.0, min(1e9, rate))
+
+            range_mV = abs(stop - start) * 1000.0
+            if range_mV <= 0:
+                return
+
+            step_mV = range_mV / max(1, points - 1)
+            sign = 1.0 if stop >= start else -1.0
+            step_v = (step_mV / 1000.0) * sign
+
+            if lock == "points":
+                self.iv_points_var.set(points)
+                self.iv_step_var.set(step_v)
+                if changed == "rate" and rate > 0:
+                    delay = step_mV / rate
+                    self.iv_delay_var.set(delay)
+                elif changed == "delay" and delay > 0:
+                    rate = step_mV / delay
+                    self.iv_scan_rate_var.set(rate)
+                else:
+                    if rate <= 0 and delay > 0:
+                        self.iv_scan_rate_var.set(step_mV / delay)
+                    elif delay <= 0 and rate > 0:
+                        self.iv_delay_var.set(step_mV / rate)
+            elif lock == "point_interval":
+                if rate > 0:
+                    step_mV = rate * delay
+                    if step_mV > 0:
+                        points = int(round(range_mV / step_mV)) + 1
+                        points = max(2, min(200000, points))
+                        step_v = (range_mV / max(1, points - 1)) / 1000.0 * sign
+                        self.iv_points_var.set(points)
+                        self.iv_step_var.set(step_v)
+            elif lock == "scan_rate":
+                if delay > 0:
+                    step_mV = rate * delay
+                    if step_mV > 0:
+                        points = int(round(range_mV / step_mV)) + 1
+                        points = max(2, min(200000, points))
+                        step_v = (range_mV / max(1, points - 1)) / 1000.0 * sign
+                        self.iv_points_var.set(points)
+                        self.iv_step_var.set(step_v)
         finally:
-            self._iv_updating = False
+            self._iv_sync_guard = False
 
     def _build_it_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
@@ -1629,7 +1852,7 @@ class App:
         ttk.Entry(inner, textvariable=self.it_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1669,7 +1892,7 @@ class App:
         ttk.Entry(inner, textvariable=self.vt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电压(V):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1709,7 +1932,7 @@ class App:
         ttk.Entry(inner, textvariable=self.rt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1749,7 +1972,7 @@ class App:
         ttk.Entry(inner, textvariable=self.pt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -2144,14 +2367,46 @@ class App:
         compliance = cfg["compliance"]
         source_mode = cfg["source_mode"]
         buffer_mode = bool(cfg.get("buffer_mode", False))
+        scan_rate = cfg.get("scan_rate_mVps", 0.0)
+        rate_seq = list(cfg.get("rate_seq_mVps") or [])
+        rate_seq_repeat = bool(cfg.get("rate_seq_repeat", False))
+        step_mV_effective = cfg.get("step_mV_effective", None)
         levels_from_cfg = cfg.get("levels_one_cycle") if buffer_mode else None
         delay_source = "point_delay" if "point_delay" in cfg else "delay"
 
         self._log(
-            f"IV timing: point_interval={point_delay}s, cycle_interval={cycle_delay}s, "
-            f"cycles={cycles}, buffer_mode={buffer_mode}, source={delay_source}"
+            f"IV timing: point_interval={point_delay}s, scan_rate={scan_rate}mV/s, "
+            f"cycle_interval={cycle_delay}s, cycles={cycles}, buffer_mode={buffer_mode}, source={delay_source}"
         )
         self._log("实际点间隔会叠加测量耗时(NPLC/通讯)，尤其在非缓存模式下")
+        self._log(
+            "验证建议: start=-5, stop=5, points=1001, scan_rate=100mV/s, cycles=3, "
+            "rate_seq=20,50,200 (不循环), cycle_delay=2s"
+        )
+
+        def pick_cycle_rate(cyc_idx: int):
+            if rate_seq:
+                if cyc_idx < len(rate_seq):
+                    return rate_seq[cyc_idx]
+                return rate_seq[cyc_idx % len(rate_seq)] if rate_seq_repeat else rate_seq[-1]
+            return scan_rate if scan_rate > 0 else 0.0
+
+        if step_mV_effective is None:
+            step_mV_effective = abs(stop - start) * 1000.0 / max(1, points - 1)
+
+        def resolve_point_delay(cyc_idx: int):
+            rate = pick_cycle_rate(cyc_idx)
+            if rate > 0 and step_mV_effective > 0:
+                return rate, step_mV_effective / rate
+            return rate, point_delay
+
+        def sleep_with_stop(duration):
+            if duration <= 0:
+                return True
+            if self.stop_event.is_set():
+                return False
+            time.sleep(duration)
+            return not self.stop_event.is_set()
 
         if buffer_mode and isinstance(levels_from_cfg, (list, tuple)):
             one_cycle = list(levels_from_cfg)
@@ -2179,35 +2434,54 @@ class App:
         if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
             try:
                 for cyc in range(cycles):
+                    if self.stop_event.is_set():
+                        break
+                    rate, cycle_point_delay = resolve_point_delay(cyc)
+                    rate_desc = f"{rate:g}" if rate > 0 else "N/A"
+                    self._log(
+                        f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
+                        f"point_delay={cycle_point_delay:.6g}s"
+                    )
                     if is_2636b:
                         readings = self.instrument.buffer_sweep_2636(
                             source_mode,
                             compliance,
                             one_cycle,
-                            point_delay,
+                            cycle_point_delay,
                         )
                     else:
                         readings = self.instrument.buffer_sweep_2400(
                             source_mode,
                             compliance,
                             one_cycle,
-                            point_delay,
+                            cycle_point_delay,
                         )
                     for idx, data in enumerate(readings):
                         sp = float(one_cycle[idx]) if idx < len(one_cycle) else 0.0
                         global_idx = cyc * len(one_cycle) + idx
                         data.update({"index": global_idx, "setpoint": sp, "cycle": cyc + 1})
+                        data["scan_rate_mVps"] = rate if rate > 0 else ""
                         data["mode"] = "IV"
                         # 实时写入：绝不阻塞
                         self._stream_submit(data)
                         self.queue.put(("data", data, self.total_points))
-                    if cyc < cycles - 1 and cycle_delay > 0 and not self.stop_event.is_set():
-                        time.sleep(cycle_delay)
+                    if cyc < cycles - 1 and cycle_delay > 0:
+                        if not sleep_with_stop(cycle_delay):
+                            break
                 return
             except Exception as exc:
                 self._log(f"缓存模式失败，回退到逐点: {exc}")
 
         for cyc in range(cycles):
+            if self.stop_event.is_set():
+                break
+            rate, cycle_point_delay = resolve_point_delay(cyc)
+            rate_desc = f"{rate:g}" if rate > 0 else "N/A"
+            self._log(
+                f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
+                f"point_delay={cycle_point_delay:.6g}s"
+            )
+            cycle_start = time.perf_counter()
             for idx_in_cycle, level in enumerate(one_cycle):
                 if self.stop_event.is_set():
                     break
@@ -2215,19 +2489,29 @@ class App:
                     self.instrument.set_level_2636(source_mode, float(level))
                 else:
                     self.instrument.configure_source(source_mode, float(level), compliance)
-                if point_delay and point_delay > 0:
-                    time.sleep(point_delay)
+                if cycle_point_delay and cycle_point_delay > 0:
+                    if not sleep_with_stop(cycle_point_delay):
+                        break
                 data = self.instrument.measure_once()
                 global_idx = cyc * len(one_cycle) + idx_in_cycle
                 data.update({"index": global_idx, "setpoint": float(level), "cycle": cyc + 1})
+                data["scan_rate_mVps"] = rate if rate > 0 else ""
                 data["mode"] = "IV"
                 # 实时写入：绝不阻塞
                 self._stream_submit(data)
                 self.queue.put(("data", data, self.total_points))
             if self.stop_event.is_set():
                 break
+            cycle_elapsed = time.perf_counter() - cycle_start
+            if one_cycle:
+                avg_per_point = cycle_elapsed / len(one_cycle)
+                self._log(
+                    f"Cycle {cyc + 1} done: points={len(one_cycle)}, "
+                    f"elapsed={cycle_elapsed:.3f}s, avg/pt={avg_per_point:.6f}s"
+                )
             if cyc < cycles - 1 and cycle_delay > 0:
-                time.sleep(cycle_delay)
+                if not sleep_with_stop(cycle_delay):
+                    break
 
     def _run_time_measurement(self, cfg, source_mode, mode=None):
         mode = mode or self.current_mode
@@ -2355,6 +2639,7 @@ class App:
             points = self.iv_points_var.get()
             cycles = self.iv_cycles_var.get()
             point_delay = self.iv_delay_var.get()
+            scan_rate = self.iv_scan_rate_var.get()
             cycle_delay = self.iv_cycle_delay_var.get()
             compliance = self.iv_compliance_var.get()
             source_mode = self.iv_source_mode_var.get()
@@ -2375,6 +2660,9 @@ class App:
             return None
         if points < 2:
             messagebox.showwarning("输入错误", "点数至少为 2")
+            return None
+        if scan_rate < 0:
+            messagebox.showwarning("输入错误", "扫描速率不能为负")
             return None
         if self.iv_triangle_from_zero_var.get():
             per_cycle = points * 3 - 2 if points > 1 else points
@@ -2408,6 +2696,14 @@ class App:
                     self._log("提示: 步长仅在缓存模式/内置 sweep 时生效，当前按点数生成扫描。")
             except Exception:
                 pass
+        range_mV = abs(stop - start) * 1000.0
+        step_mV_effective = range_mV / max(1, points - 1)
+        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get())
+        rate_seq_repeat = bool(self.iv_rate_seq_repeat_var.get())
+        if scan_rate > 0:
+            point_delay_effective = step_mV_effective / scan_rate if step_mV_effective > 0 else 0.0
+            self._log(f"按扫描速率换算 point_delay={point_delay_effective:.6g}s")
+            point_delay = point_delay_effective
         return dict(
             start=start,
             stop=stop,
@@ -2420,6 +2716,10 @@ class App:
             point_delay=point_delay,
             cycle_delay=cycle_delay,
             per_cycle=per_cycle,
+            step_mV_effective=step_mV_effective,
+            scan_rate_mVps=scan_rate,
+            rate_seq_mVps=rate_seq,
+            rate_seq_repeat=rate_seq_repeat,
             compliance=compliance,
             source_mode="Voltage" if source_mode == "Voltage" else "Current",
             total_points=total_points,
@@ -3064,7 +3364,7 @@ class App:
 
         fieldnames = [
             "timestamp", "index", "cycle", "mode", "setpoint",
-            "voltage", "current", "resistance", "power", "pressure",
+            "scan_rate_mVps", "voltage", "current", "resistance", "power", "pressure",
         ]
         path = self.make_output_path(mode, suffix=".txt", extra="stream")
         header = [
