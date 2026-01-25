@@ -1468,7 +1468,7 @@ class App:
         self.iv_rate_lock_var = tk.StringVar(value="锁定点数")
         self.iv_rate_seq_text = tk.StringVar(value="")
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
-        self.iv_rate_timing_mode_var = tk.StringVar(value="by_step")
+        self.iv_rate_timing_mode_var = tk.StringVar(value="by_interval")
         # by_step=固定步长(改点间隔)；by_interval=固定点间隔(改步长/点数)
         self.iv_rate_tool_enabled_var = tk.BooleanVar(value=False)
         self.iv_rate_cycles_var = tk.IntVar(value=int(self.iv_cycles_var.get() or 1))
@@ -2153,6 +2153,7 @@ class App:
             except Exception:
                 pass
         if enabled:
+            self.iv_rate_timing_mode_var.set("by_interval")
             self.iv_rate_seq_repeat_var.set(True)
             calc = self._calc_rate_tool_total_cycles()
             if calc:
@@ -2903,6 +2904,7 @@ class App:
         is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
         if is_2636b:
             self.instrument.prepare_source_2636(source_mode, compliance)
+        stop_event = self.stop_event
 
         for cyc in range(cycles):
             if self.stop_event.is_set():
@@ -2937,12 +2939,6 @@ class App:
                 self._log("固定点间隔模式下总时长为 0，已停止。")
                 break
 
-            tick_times = [0.0]
-            while tick_times[-1] + dt < total_T:
-                tick_times.append(tick_times[-1] + dt)
-            if tick_times[-1] < total_T:
-                tick_times.append(total_T)
-
             def level_at(t_rel: float) -> float:
                 for t_start, t_end, v0, v1 in segments:
                     if t_rel <= t_end + 1e-12:
@@ -2953,39 +2949,105 @@ class App:
                         return float(v0 + (v1 - v0) * frac)
                 return float(endpoints[-1])
 
-            rate_desc = f"{rate:g}" if rate > 0 else "N/A"
-            self._log(
-                f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
-                f"point_interval={dt:.6g}s, total_T={total_T:.6g}s, points={len(tick_times)}"
-            )
             if not is_2636b:
                 self.instrument.configure_source(source_mode, float(endpoints[0]), compliance)
+
+            # --- Fixed point interval mode (time-driven, counter-style) ---
+            # “计数器”= 用真实 elapsed 时间决定当前 tick_idx，从而决定 t_rel -> voltage
+            # 这样即使通讯/积分导致跑不动，也不会用“落后的 t_rel”拖慢等效扫描速率（允许跳 tick）
+
+            dt = float(point_interval_s)
+            dt = max(1e-4, dt)  # 防止 0 或极小值导致除零/忙等
+            rate_mvps = rate
+
             cycle_start = time.perf_counter()
-            for idx_in_cycle, t_rel in enumerate(tick_times):
-                if self.stop_event.is_set():
+            last_tick_idx = -1
+
+            # 估计点数（仅用于日志/进度；实际可能因跳 tick 少一些）
+            est_points = int(total_T // dt) + 1
+
+            self.queue.put(
+                (
+                    "log",
+                    f"[IV][by_interval] rate={rate_mvps} mV/s, dt={dt:.6g}s, total_T={total_T:.6g}s, "
+                    f"est_points≈{est_points}",
+                )
+            )
+
+            points_in_cycle = 0
+            while not stop_event.is_set():
+                # 下一个“理论触发时刻”（按计数器推进）
+                target = cycle_start + (last_tick_idx + 1) * dt
+
+                # 等到 target；如果已经晚了，sleep_until 会立即返回 True（不再拖慢）
+                if not sleep_until(target):
                     break
-                if not sleep_until(cycle_start + t_rel):
-                    break
-                level = level_at(t_rel)
+
+                now = time.perf_counter()
+                elapsed = now - cycle_start
+
+                # 计数器：tick_idx 由真实 elapsed/dt 决定（可能一次跳过多个 tick）
+                tick_idx = int(elapsed / dt)
+
+                # 极端情况下（系统时钟抖动）防止回退
+                if tick_idx <= last_tick_idx:
+                    tick_idx = last_tick_idx + 1
+                last_tick_idx = tick_idx
+
+                # “此刻应该到的电压”由 t_rel 决定；t_rel 只看计数器*dt，并钳位到 total_T
+                t_rel = tick_idx * dt
+                if t_rel >= total_T:
+                    t_rel = total_T
+
+                level = float(level_at(t_rel))
+
+                # 设置源表电平
                 if is_2636b:
-                    self.instrument.set_level_2636(source_mode, float(level))
+                    self.instrument.set_level_2636(source_mode, level)
                 else:
-                    self.instrument.set_level_2400(source_mode, float(level))
-                data = self.instrument.measure_once()
-                data.update({"index": global_idx, "setpoint": float(level), "cycle": cyc + 1})
-                data["scan_rate_mVps"] = rate if rate > 0 else ""
-                data["mode"] = "IV"
-                # 实时写入：绝不阻塞
-                self._stream_submit(data)
-                self.queue.put(("data", data, self.total_points))
+                    self.instrument.set_level_2400(source_mode, level)
+
+                # 读取一次测量值
+                meas = self.instrument.measure_once()
+                v_meas = float(meas.get("voltage", level))
+                i_meas = float(meas.get("current", 0.0))
+
+                meas.update(
+                    {
+                        "setpoint": level,      # 你要绑定的“应发电压”
+                        "voltage": v_meas,      # 实测电压（用于画 IV 的横轴也行）
+                        "current": i_meas,
+                        "tick": tick_idx,
+                        "t_rel_s": t_rel,       # 计数器时间（理想时间轴）
+                        "t_actual_s": elapsed,  # 实际时间（用于诊断是否跑不动）
+                        "lag_s": elapsed - t_rel,
+                        "rate_mvps": rate_mvps,
+                    }
+                )
+
+                # 进度 idx 递增
+                meas["index"] = global_idx
+                meas["cycle"] = cyc + 1
+                meas["scan_rate_mVps"] = rate if rate > 0 else ""
+                meas["mode"] = "IV"
                 global_idx += 1
+                points_in_cycle += 1
+
+                # 实时写入：绝不阻塞
+                self._stream_submit(meas)
+                # 推送 UI
+                self.queue.put(("data", dict(meas), self.total_points))
+
+                # 到达末端就结束这一圈
+                if t_rel >= total_T:
+                    break
             if self.stop_event.is_set():
                 break
             cycle_elapsed = time.perf_counter() - cycle_start
-            if tick_times:
-                avg_per_point = cycle_elapsed / len(tick_times)
+            if points_in_cycle:
+                avg_per_point = cycle_elapsed / points_in_cycle
                 self._log(
-                    f"Cycle {cyc + 1} done: points={len(tick_times)}, "
+                    f"Cycle {cyc + 1} done: points={points_in_cycle}, "
                     f"elapsed={cycle_elapsed:.3f}s, avg/pt={avg_per_point:.6f}s"
                 )
             if cyc < cycles - 1 and cycle_delay > 0:
@@ -3546,6 +3608,18 @@ class App:
         self.current_data.append(data_copy)
         if self._first_timestamp is None:
             self._first_timestamp = data_copy.get("timestamp", data.get("timestamp", 0.0))
+        # --- UI/内存裁剪：避免 current_data 无限增长导致卡顿 ---
+        try:
+            keep = int(self.mem_keep_points_var.get())
+        except Exception:
+            keep = 0
+
+        if keep > 0 and len(self.current_data) > keep:
+            # 只保留最后 keep 个点
+            self.current_data = self.current_data[-keep:]
+            # 同步“起始时间戳”，避免时间轴巨大导致绘图/格式化变慢
+            if self.current_data:
+                self._first_timestamp = self.current_data[0].get("timestamp", self._first_timestamp)
 
         self.completed_points = idx + 1
 
