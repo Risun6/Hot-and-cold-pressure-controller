@@ -1442,6 +1442,8 @@ class App:
         self.iv_rate_lock_var = tk.StringVar(value="锁定点数")
         self.iv_rate_seq_text = tk.StringVar(value="")
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
+        self.iv_rate_tool_enabled_var = tk.BooleanVar(value=False)
+        self.iv_rate_cycles_var = tk.IntVar(value=int(self.iv_cycles_var.get() or 1))
         self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
@@ -1465,7 +1467,8 @@ class App:
         mode_combo.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
 
         ttk.Label(inner, text="循环次数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        ttk.Entry(inner, textvariable=self.iv_cycles_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        self.iv_cycles_entry = ttk.Entry(inner, textvariable=self.iv_cycles_var, width=10)
+        self.iv_cycles_entry.grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
         ttk.Label(inner, text="起点:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
@@ -1511,6 +1514,13 @@ class App:
             sticky="w",
             pady=(0, 6),
         )
+        self.iv_rate_tool_enable_chk = ttk.Checkbutton(
+            inner,
+            text="启用速率序列工具",
+            variable=self.iv_rate_tool_enabled_var,
+            command=self._sync_iv_rate_tool_state,
+        )
+        self.iv_rate_tool_enable_chk.grid(row=row, column=2, columnspan=2, sticky="w", pady=(2, 6))
         row += 1
 
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
@@ -1593,6 +1603,8 @@ class App:
             lambda *args: (self._sync_iv_lock_widgets(), self._iv_sync_rate_delay_points("lock")),
         )
         self._sync_iv_lock_widgets()
+        self.iv_rate_cycles_var.trace_add("write", lambda *args: self._on_iv_rate_cycles_change())
+        self._sync_iv_rate_tool_state()
 
     def _toggle_iv_quality_frame(self):
         if self.iv_quality_enabled_var.get():
@@ -1701,11 +1713,24 @@ class App:
             variable=self.iv_rate_seq_repeat_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        ttk.Label(parent, text="扫描周期次数:").grid(row=4, column=0, sticky="e", pady=(2, 0), padx=(0, 4))
+        ttk.Entry(parent, textvariable=self.iv_rate_cycles_var, width=12).grid(
+            row=4,
+            column=1,
+            sticky="w",
+            pady=(2, 0),
+        )
+
         mode_frame = ttk.Labelframe(parent, text="扫描模式", padding=8)
-        mode_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        mode_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+
+        def _cycles_var_for_mode():
+            if getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get():
+                return self.iv_rate_cycles_var
+            return self.iv_cycles_var
 
         def infer_mode():
-            if self.iv_cycles_var.get() == 1 and not self.iv_backforth_var.get():
+            if _cycles_var_for_mode().get() == 1 and not self.iv_backforth_var.get():
                 return "single_forward"
             if self.iv_backforth_var.get():
                 return "multi_backforth"
@@ -1714,7 +1739,7 @@ class App:
         def apply_mode():
             mode = self.iv_rate_mode_var.get()
             if mode == "single_forward":
-                self.iv_cycles_var.set(1)
+                _cycles_var_for_mode().set(1)
                 self.iv_backforth_var.set(False)
                 self.iv_triangle_from_zero_var.set(False)
             elif mode == "multi_forward":
@@ -1980,6 +2005,36 @@ class App:
                         self.iv_step_var.set(step_v)
         finally:
             self._iv_sync_guard = False
+
+    def _sync_iv_rate_tool_state(self):
+        enabled = bool(
+            getattr(self, "iv_rate_tool_enabled_var", None) and self.iv_rate_tool_enabled_var.get()
+        )
+        if getattr(self, "iv_cycles_entry", None) is not None:
+            try:
+                self.iv_cycles_entry.configure(state="disabled" if enabled else "normal")
+            except Exception:
+                pass
+        if enabled:
+            try:
+                v = int(self.iv_rate_cycles_var.get())
+                if v > 0:
+                    self.iv_cycles_var.set(v)
+            except Exception:
+                pass
+
+    def _on_iv_rate_cycles_change(self):
+        if not (
+            getattr(self, "iv_rate_tool_enabled_var", None)
+            and self.iv_rate_tool_enabled_var.get()
+        ):
+            return
+        try:
+            v = int(self.iv_rate_cycles_var.get())
+            if v > 0:
+                self.iv_cycles_var.set(v)
+        except Exception:
+            pass
 
     def _build_it_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
@@ -2791,7 +2846,11 @@ class App:
             stop = self.iv_stop_var.get()
             step = self.iv_step_var.get()
             points = self.iv_points_var.get()
-            cycles = self.iv_cycles_var.get()
+            tool_enabled = bool(
+                getattr(self, "iv_rate_tool_enabled_var", None)
+                and self.iv_rate_tool_enabled_var.get()
+            )
+            cycles = self.iv_rate_cycles_var.get() if tool_enabled else self.iv_cycles_var.get()
             point_delay = self.iv_delay_var.get()
             scan_rate = self.iv_scan_rate_var.get()
             cycle_delay = self.iv_cycle_delay_var.get()
@@ -2810,7 +2869,7 @@ class App:
             messagebox.showwarning("输入错误", "保护值必须为正数")
             return None
         if cycles < 1:
-            messagebox.showwarning("输入错误", "循环次数至少为 1")
+            messagebox.showwarning("输入错误", "扫描周期次数必须 >= 1")
             return None
         if points < 2:
             messagebox.showwarning("输入错误", "点数至少为 2")
@@ -2852,8 +2911,8 @@ class App:
                 pass
         range_mV = abs(stop - start) * 1000.0
         step_mV_effective = range_mV / max(1, points - 1)
-        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get())
-        rate_seq_repeat = bool(self.iv_rate_seq_repeat_var.get())
+        rate_seq = self._parse_iv_rate_seq_text(self.iv_rate_seq_text.get()) if tool_enabled else []
+        rate_seq_repeat = bool(self.iv_rate_seq_repeat_var.get()) if tool_enabled else False
         if scan_rate > 0:
             point_delay_effective = step_mV_effective / scan_rate if step_mV_effective > 0 else 0.0
             self._log(f"按扫描速率换算 point_delay={point_delay_effective:.6g}s")
@@ -3967,6 +4026,11 @@ class App:
         try:
             if hasattr(self, "plot_style_var"):
                 self._apply_plot_style()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_sync_iv_rate_tool_state"):
+                self._sync_iv_rate_tool_state()
         except Exception:
             pass
 
