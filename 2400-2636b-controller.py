@@ -23,7 +23,7 @@ import copy
 import queue
 import datetime
 import statistics
-from collections import defaultdict
+from collections import defaultdict, deque
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -73,6 +73,91 @@ class SimpleToolTip:
             except Exception:
                 pass
             self.tip = None
+
+
+class AsyncTxtWriter:
+    """
+    非阻塞实时写入：测量线程 submit() 只做 put_nowait；
+    真正落盘在后台线程完成。队列满就丢弃（保证不拖慢测量/发送）。
+    """
+
+    def __init__(self, path, fieldnames, flush_interval=0.5, queue_max=20000, sep="\t"):
+        self.path = path
+        self.fieldnames = list(fieldnames)
+        self.flush_interval = max(0.05, float(flush_interval))
+        self.sep = sep
+        self.q = queue.Queue(maxsize=int(queue_max))
+        self._stop = threading.Event()
+        self._thread = None
+        self._fh = None
+        self.dropped = 0
+
+    def start(self, header_lines=None):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
+        if header_lines:
+            for line in header_lines:
+                if not line.endswith("\n"):
+                    line += "\n"
+                self._fh.write(line)
+        # 写列名
+        self._fh.write(self.sep.join(self.fieldnames) + "\n")
+        self._fh.flush()
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, row: dict):
+        if self._fh is None:
+            return
+        try:
+            self.q.put_nowait(dict(row))
+        except queue.Full:
+            self.dropped += 1  # 不阻塞：宁可丢也别卡住测量线程
+
+    def close(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        try:
+            if self._fh is not None:
+                self._fh.flush()
+                self._fh.close()
+        finally:
+            self._fh = None
+
+    @staticmethod
+    def _fmt(v):
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:.12e}"
+        return str(v)
+
+    def _run(self):
+        buf = []
+        last_flush = time.time()
+
+        while not self._stop.is_set() or not self.q.empty():
+            try:
+                item = self.q.get(timeout=self.flush_interval)
+                buf.append(item)
+            except queue.Empty:
+                pass
+
+            now = time.time()
+            if (now - last_flush) >= self.flush_interval and self._fh is not None:
+                if buf:
+                    lines = []
+                    for row in buf:
+                        lines.append(self.sep.join(self._fmt(row.get(k, "")) for k in self.fieldnames) + "\n")
+                    self._fh.writelines(lines)
+                    buf.clear()
+                try:
+                    self._fh.flush()
+                except Exception:
+                    pass
+                last_flush = now
 
 
 class KeithleyInstrument:
@@ -888,6 +973,26 @@ class App:
         self._filtered_pressure_ts = None                    # 压力更新时间戳
         self.current_mode = None  # "IV", "It", "Vt", "Rt", "Pt"
         self.current_data = []
+        # ---- 长时间 IV 循环：性能开关 ----
+        self.plot_enabled_var = tk.BooleanVar(value=True)            # 可选关闭实时绘图
+        self.plot_update_interval_var = tk.DoubleVar(value=0.20)     # 绘图刷新最小间隔(s)
+
+        self.log_points_var = tk.BooleanVar(value=True)              # 可选减少日志
+        self.log_every_n_var = tk.IntVar(value=1)                    # 每 N 点打印一次
+        self.log_max_lines_var = tk.IntVar(value=2000)               # Text 最大行数，防爆内存
+
+        self.stream_txt_var = tk.BooleanVar(value=False)             # 实时写入 TXT
+        self.stream_flush_interval_var = tk.DoubleVar(value=0.5)     # writer flush(s)
+        self.stream_queue_max_var = tk.IntVar(value=20000)           # writer 队列上限
+        self.mem_keep_points_var = tk.IntVar(value=0)                # 内存只保留最近 N 点(0=不限制)
+
+        self.ui_max_items_per_poll_var = tk.IntVar(value=300)        # UI 每次轮询最多处理队列项
+
+        # runtime
+        self._stream_writer = None
+        self._stream_path = None
+        self._first_timestamp = None
+        self._last_plot_draw_ts = 0.0
         self.total_points = 0
         self.completed_points = 0
         self.start_time = None
@@ -1061,6 +1166,32 @@ class App:
         )
         self.integration_time_entry.pack(side=tk.LEFT, padx=5, pady=2)
 
+        longrun_frame = ttk.Frame(top_lf)
+        longrun_frame.grid(row=4, column=0, columnspan=7, sticky="w", pady=(6, 0))
+
+        ttk.Checkbutton(longrun_frame, text="实时写入TXT", variable=self.stream_txt_var).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Label(longrun_frame, text="Flush(s)").grid(row=0, column=1)
+        ttk.Entry(longrun_frame, textvariable=self.stream_flush_interval_var, width=6).grid(
+            row=0, column=2, padx=(4, 10)
+        )
+
+        ttk.Label(longrun_frame, text="WriterQueue").grid(row=0, column=3)
+        ttk.Entry(longrun_frame, textvariable=self.stream_queue_max_var, width=7).grid(
+            row=0, column=4, padx=(4, 10)
+        )
+
+        ttk.Label(longrun_frame, text="内存保留点数(0=不限制)").grid(row=0, column=5)
+        ttk.Entry(longrun_frame, textvariable=self.mem_keep_points_var, width=8).grid(
+            row=0, column=6, padx=(4, 10)
+        )
+
+        ttk.Label(longrun_frame, text="UI每次处理").grid(row=0, column=7)
+        ttk.Entry(longrun_frame, textvariable=self.ui_max_items_per_poll_var, width=6).grid(
+            row=0, column=8, padx=(4, 0)
+        )
+
         # 中间：左窄（参数+日志），右宽（图表）
         mid_lf = ttk.Labelframe(self.root, text="模式参数 & 实时显示", padding=8)
         mid_lf.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -1136,6 +1267,22 @@ class App:
         )
         style_combo.grid(row=0, column=1, sticky="w", padx=(4, 0))
         style_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_plot_style())
+
+        ttk.Checkbutton(style_frame, text="实时绘图", variable=self.plot_enabled_var).grid(
+            row=0, column=2, padx=(12, 0)
+        )
+        ttk.Label(style_frame, text="刷新(s)").grid(row=0, column=3, padx=(12, 0))
+        ttk.Entry(style_frame, textvariable=self.plot_update_interval_var, width=6).grid(
+            row=0, column=4, padx=(4, 0)
+        )
+
+        ttk.Checkbutton(style_frame, text="减少日志", variable=self.log_points_var).grid(
+            row=0, column=5, padx=(12, 0)
+        )
+        ttk.Label(style_frame, text="每N点").grid(row=0, column=6, padx=(6, 0))
+        ttk.Entry(style_frame, textvariable=self.log_every_n_var, width=5).grid(
+            row=0, column=7, padx=(4, 0)
+        )
 
         bottom = ttk.Frame(self.root, padding=8)
         bottom.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
@@ -1881,12 +2028,30 @@ class App:
         self.current_mode = mode
         # 只在 IV 模式下记录源模式，其它模式用 None
         self.current_source_mode = config.get("source_mode") if mode == "IV" else None
-        self.current_data = []
+        # 先关掉上一轮可能残留的 writer
+        self._stop_stream_writer()
+
+        self._first_timestamp = None
+        self._last_plot_draw_ts = 0.0
+
+        # 内存缓存策略：0=不限制；>0=只保留最近 N 点（实时“清缓存”）
+        try:
+            keep_n = int(self.mem_keep_points_var.get())
+        except Exception:
+            keep_n = 0
+        if keep_n > 0:
+            self.current_data = deque(maxlen=keep_n)
+        else:
+            self.current_data = []
+
         self.total_points = config.get("total_points", 0)
         self.completed_points = 0
         self.start_time = time.time()
 
         self._reset_plot()
+
+        # 开启实时写入（不阻塞测量线程）
+        self._start_stream_writer(mode, config)
 
         if self.total_points > 0:
             self.progress.config(mode="determinate", maximum=self.total_points)
@@ -1972,6 +2137,9 @@ class App:
                 for idx, data in enumerate(readings):
                     sp = float(seq[idx]) if idx < len(seq) else 0.0
                     data.update({"index": idx, "setpoint": sp})
+                    data["mode"] = "IV"
+                    # 实时写入：绝不阻塞
+                    self._stream_submit(data)
                     self.queue.put(("data", data, self.total_points))
                 return
             except Exception as exc:
@@ -1988,6 +2156,9 @@ class App:
                 time.sleep(delay)
             data = self.instrument.measure_once()
             data.update({"index": idx, "setpoint": float(level)})
+            data["mode"] = "IV"
+            # 实时写入：绝不阻塞
+            self._stream_submit(data)
             self.queue.put(("data", data, self.total_points))
 
     def _run_time_measurement(self, cfg, source_mode, mode=None):
@@ -2011,6 +2182,9 @@ class App:
             while not self.stop_event.is_set():
                 data = self.instrument.measure_once()
                 data.update({"index": idx, "setpoint": bias})
+                data["mode"] = mode
+                # 实时写入：绝不阻塞
+                self._stream_submit(data)
                 self.queue.put(("data", data, 0))
                 idx += 1
                 if delay and delay > 0:
@@ -2025,6 +2199,9 @@ class App:
                         readings = self.instrument.buffer_sweep_2400(source_mode, compliance, seq, delay)
                     for idx, data in enumerate(readings):
                         data.update({"index": idx, "setpoint": bias})
+                        data["mode"] = mode
+                        # 实时写入：绝不阻塞
+                        self._stream_submit(data)
                         self.queue.put(("data", data, self.total_points))
                     return
                 except Exception as exc:
@@ -2035,6 +2212,9 @@ class App:
                     break
                 data = self.instrument.measure_once()
                 data.update({"index": idx, "setpoint": bias})
+                data["mode"] = mode
+                # 实时写入：绝不阻塞
+                self._stream_submit(data)
                 self.queue.put(("data", data, self.total_points))
                 if delay and delay > 0:
                     time.sleep(delay)
@@ -2326,24 +2506,39 @@ class App:
 
     def _poll_queue(self):
         try:
-            while True:
+            max_items = int(self.ui_max_items_per_poll_var.get())
+        except Exception:
+            max_items = 300
+        max_items = max(50, max_items)
+
+        processed = 0
+        try:
+            while processed < max_items:
                 item = self.queue.get_nowait()
-                kind = item[0]
-                if kind == "data":
-                    data, total = item[1], item[2]
-                    self._handle_data(data, total)
-                elif kind == "error":
-                    msg = item[1]
-                    self._log("错误: " + msg)
-                    messagebox.showerror("测量错误", msg)
-                elif kind == "log":
+                item_type = item[0]
+                if item_type == "data":
+                    if len(item) >= 3:
+                        data, total_points = item[1], item[2]
+                    else:
+                        data, total_points = item[1]
+                    self._handle_data(data, total_points)
+                elif item_type == "error":
+                    self._log(f"错误: {item[1]}")
+                    # 长循环不建议频繁弹窗，真要弹窗也会卡 UI
+                    # messagebox.showerror("错误", item[1])
+                elif item_type == "log":
                     self._log(item[1])
-                elif kind == "finished":
+                elif item_type == "finished":
                     self._finish_measurement()
+
                 self.queue.task_done()
+                processed += 1
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+
+        # 队列还很多就尽快再跑一次，否则放慢点
+        delay_ms = 1 if processed >= max_items else 50
+        self.root.after(delay_ms, self._poll_queue)
 
     def _format_seconds(self, sec: int) -> str:
         sec = int(max(0, sec))
@@ -2358,15 +2553,12 @@ class App:
     def _handle_data(self, data, total_points):
         try:
             idx = int(data.get("index", 0))
-            setpoint = float(data.get("setpoint", 0.0))
             v = float(data.get("voltage", 0.0))
             c = float(data.get("current", 0.0))
         except Exception as exc:
             self._log(f"忽略无效数据: {exc}")
             return
 
-        line = f"[{idx:04d}] set={setpoint:.5g}, V={v:.5g}, I={c:.5g}"
-        self._log(line)
         resistance = ""
         if c != 0:
             try:
@@ -2387,12 +2579,36 @@ class App:
             "power": power,
         })
 
+        if bool(self.log_points_var.get()):
+            try:
+                n = max(1, int(self.log_every_n_var.get()))
+            except Exception:
+                n = 1
+            if (idx + 1) % n == 0:
+                self._log(f"[{idx + 1}/{total_points}] {data_copy['setpoint']}: {data_copy['current']:.3e} A")
+
         self.current_data.append(data_copy)
+        if self._first_timestamp is None:
+            self._first_timestamp = data_copy.get("timestamp", data.get("timestamp", 0.0))
 
         self.completed_points = idx + 1
 
+        do_plot = bool(self.plot_enabled_var.get())
+        if do_plot:
+            try:
+                min_dt = float(self.plot_update_interval_var.get())
+            except Exception:
+                min_dt = 0.2
+            min_dt = max(0.0, min_dt)
+            now = time.time()
+            # 限频：不到间隔就不重画（但仍然更新进度/数据）
+            if min_dt > 0 and (now - self._last_plot_draw_ts) < min_dt and total_points != (idx + 1):
+                do_plot = False
+            else:
+                self._last_plot_draw_ts = now
+
         # 更新曲线
-        if self.current_mode == "IV":
+        if do_plot and self.current_mode == "IV":
             # IV：根据源模式决定横轴
             src_mode = getattr(self, "current_source_mode", "Voltage")
 
@@ -2464,9 +2680,9 @@ class App:
             self.ax.set_ylabel("Current (A)")
 
 
-        elif self.current_mode == "It":
+        elif do_plot and self.current_mode == "It":
             # I-t：横轴为时间，纵轴为电流
-            base_ts = self.current_data[0].get("timestamp", data.get("timestamp", 0.0))
+            base_ts = self._first_timestamp if self._first_timestamp is not None else data.get("timestamp", 0.0)
             xs = [d.get("timestamp", base_ts) - base_ts for d in self.current_data]
             ys = [d.get("current", 0.0) for d in self.current_data]
 
@@ -2477,8 +2693,8 @@ class App:
             self.ax.set_xlabel("Time (s)")
             self.ax.set_ylabel("Current (A)")
 
-        elif self.current_mode == "Rt":
-            base_ts = self.current_data[0].get("timestamp", data.get("timestamp", 0.0))
+        elif do_plot and self.current_mode == "Rt":
+            base_ts = self._first_timestamp if self._first_timestamp is not None else data.get("timestamp", 0.0)
             xs = [d.get("timestamp", base_ts) - base_ts for d in self.current_data]
             ys = []
             for d in self.current_data:
@@ -2495,8 +2711,8 @@ class App:
             self.ax.set_xlabel("Time (s)")
             self.ax.set_ylabel("Resistance (Ohm)")
 
-        elif self.current_mode == "Pt":
-            base_ts = self.current_data[0].get("timestamp", data.get("timestamp", 0.0))
+        elif do_plot and self.current_mode == "Pt":
+            base_ts = self._first_timestamp if self._first_timestamp is not None else data.get("timestamp", 0.0)
             xs = [d.get("timestamp", base_ts) - base_ts for d in self.current_data]
             ys = []
             for d in self.current_data:
@@ -2513,9 +2729,9 @@ class App:
             self.ax.set_xlabel("Time (s)")
             self.ax.set_ylabel("Power (W)")
 
-        else:
+        elif do_plot:
             # V-t：横轴为时间，纵轴为电压
-            base_ts = self.current_data[0].get("timestamp", data.get("timestamp", 0.0))
+            base_ts = self._first_timestamp if self._first_timestamp is not None else data.get("timestamp", 0.0)
             xs = [d.get("timestamp", base_ts) - base_ts for d in self.current_data]
             ys = [d.get("voltage", 0.0) for d in self.current_data]
 
@@ -2526,23 +2742,24 @@ class App:
             self.ax.set_xlabel("Time (s)")
             self.ax.set_ylabel("Voltage (V)")
 
-        # 确保没有图例
-        leg = self.ax.get_legend()
-        if leg is not None:
+        if do_plot:
+            # 确保没有图例
+            leg = self.ax.get_legend()
+            if leg is not None:
+                try:
+                    leg.remove()
+                except Exception:
+                    pass
+
+            # 自动范围 + 当前绘图样式
+            self.ax.relim()
+            self.ax.autoscale_view()
             try:
-                leg.remove()
+                self._apply_plot_style()
             except Exception:
                 pass
 
-        # 自动范围 + 当前绘图样式
-        self.ax.relim()
-        self.ax.autoscale_view()
-        try:
-            self._apply_plot_style()
-        except Exception:
-            pass
-
-        self.canvas.draw_idle()
+            self.canvas.draw_idle()
 
         # 进度条 + 点数 / 剩余时间
         if total_points > 0:
@@ -2651,6 +2868,7 @@ class App:
         return False
 
     def _finish_measurement(self):
+        self._stop_stream_writer()
         self.instrument.output_off()
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
@@ -2755,6 +2973,72 @@ class App:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         self._log(f"日志已导出到 {path}")
+
+    def _start_stream_writer(self, mode, config):
+        if not bool(self.stream_txt_var.get()):
+            self._stream_writer = None
+            self._stream_path = None
+            return
+
+        try:
+            flush_s = float(self.stream_flush_interval_var.get())
+        except Exception:
+            flush_s = 0.5
+        try:
+            qmax = int(self.stream_queue_max_var.get())
+        except Exception:
+            qmax = 20000
+
+        fieldnames = [
+            "timestamp", "index", "cycle", "mode", "setpoint",
+            "voltage", "current", "resistance", "power", "pressure",
+        ]
+        path = self.make_output_path(mode, suffix=".txt", extra="stream")
+        header = [
+            f"# mode={mode}",
+            f"# conn={self.instrument.conn_type}",
+            f"# start_iso={datetime.datetime.now().isoformat(timespec='seconds')}",
+            "# format=tsv",
+        ]
+        self._stream_writer = AsyncTxtWriter(path, fieldnames, flush_interval=flush_s, queue_max=qmax, sep="\t")
+        self._stream_writer.start(header_lines=header)
+        self._stream_path = path
+        self._log(f"已开启实时写入：{path}")
+
+    def _stream_submit(self, row: dict):
+        w = getattr(self, "_stream_writer", None)
+        if w is None:
+            return
+        # 补齐派生量（不影响 UI，只为落盘完整）
+        try:
+            v = float(row.get("voltage", 0.0))
+            c = float(row.get("current", 0.0))
+        except Exception:
+            v, c = 0.0, 0.0
+        row.setdefault("power", v * c)
+        if c:
+            row.setdefault("resistance", v / c)
+        else:
+            row.setdefault("resistance", "")
+        try:
+            w.submit(row)
+        except Exception:
+            pass
+
+    def _stop_stream_writer(self):
+        w = getattr(self, "_stream_writer", None)
+        if w is None:
+            return
+        path = getattr(self, "_stream_path", None)
+        dropped = getattr(w, "dropped", 0)
+        try:
+            w.close()
+        except Exception:
+            pass
+        self._stream_writer = None
+        self._stream_path = None
+        if path:
+            self._log(f"实时写入已结束：{path}（丢弃 {dropped} 条）")
 
     def _save_data_to_csv(self, path, *, extra_comments=None):
         keys = ["index", "timestamp", "setpoint", "voltage", "current", "resistance", "power"]
@@ -2947,9 +3231,31 @@ class App:
         widget.bind("<Control-Button-1>", _to_log, add="+")
 
     def _log(self, msg):
-        ts = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {msg}\n")
-        self.log_text.see("end")
+        # 允许工作线程调用：转发到 UI 队列
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.queue.put(("log", msg))
+            except Exception:
+                pass
+            return
+
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            self.log_text.insert("end", f"{now}  {msg}\n")
+
+            # 限制最大行数，实时清理缓存
+            try:
+                max_lines = int(self.log_max_lines_var.get())
+            except Exception:
+                max_lines = 2000
+            if max_lines > 0:
+                line_count = int(self.log_text.index("end-1c").split(".")[0])
+                if line_count > max_lines:
+                    self.log_text.delete("1.0", f"{line_count - max_lines + 1}.0")
+
+            self.log_text.see("end")
+        except Exception:
+            pass
 
     def on_close(self):
         if self.measurement_thread is not None and self.measurement_thread.is_alive():
