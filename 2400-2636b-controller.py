@@ -1507,8 +1507,8 @@ class App:
         row += 1
 
         ttk.Label(inner, text="步长:").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
-        step_entry = ttk.Entry(inner, textvariable=self.iv_step_var, width=10)
-        step_entry.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
+        self.iv_step_entry = ttk.Entry(inner, textvariable=self.iv_step_var, width=10)
+        self.iv_step_entry.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         self.iv_points_entry = ttk.Entry(inner, textvariable=self.iv_points_var, width=10)
         self.iv_points_entry.grid(row=row, column=3, sticky="w", pady=4)
@@ -1618,7 +1618,7 @@ class App:
         self._toggle_iv_quality_frame()
 
         # 步长 / 点数 联动
-        step_entry.bind("<FocusOut>", lambda e: self._update_points_from_step())
+        self.iv_step_entry.bind("<FocusOut>", lambda e: self._update_points_from_step())
         self.iv_points_entry.bind("<FocusOut>", lambda e: self._update_step_from_points())
         for var, changed in (
             (self.iv_start_var, "range"),
@@ -1924,18 +1924,69 @@ class App:
             rate = float(self.iv_scan_rate_var.get())
         except tk.TclError:
             return
-        points = max(2, points)
+        timing_mode = self.iv_rate_timing_mode_var.get()
+        if timing_mode == "by_interval":
+            if self.iv_rate_lock_var.get() != "锁定点间隔":
+                self.iv_rate_lock_var.set("锁定点间隔")
+            for widget in (getattr(self, "iv_points_entry", None), getattr(self, "iv_step_entry", None)):
+                if widget is None:
+                    continue
+                try:
+                    widget.state(["disabled"])
+                except Exception:
+                    pass
+        else:
+            for widget in (getattr(self, "iv_points_entry", None), getattr(self, "iv_step_entry", None)):
+                if widget is None:
+                    continue
+                try:
+                    widget.state(["!disabled"])
+                except Exception:
+                    pass
+
         range_mV = abs(stop - start) * 1000.0
-        step_mV = range_mV / max(1, points - 1)
-        text = (
-            "当前 IV 参数换算:\n"
-            f"- 范围: {range_mV:.6g} mV\n"
-            f"- 步长: {step_mV:.6g} mV\n"
-            f"- 点数: {points}\n"
-            f"- 点间隔: {delay:.6g} s\n"
-            f"- 扫描速率: {rate:.6g} mV/s\n"
-            "关系: 扫描速率 = 步长 / 点间隔"
-        )
+        if timing_mode == "by_interval":
+            rate_Vps = rate / 1000.0 if rate else 0.0
+            if self.iv_triangle_from_zero_var.get():
+                endpoints = [0.0, stop, start, 0.0]
+            elif self.iv_backforth_var.get():
+                endpoints = [start, stop, start]
+            else:
+                endpoints = [start, stop]
+            total_T = 0.0
+            if rate_Vps > 0:
+                for v0, v1 in zip(endpoints, endpoints[1:]):
+                    total_T += abs(v1 - v0) / rate_Vps
+            est_points = None
+            if delay > 0 and total_T > 0:
+                est_points = int(math.floor(total_T / delay)) + 1
+                if total_T - (est_points - 1) * delay > 1e-9:
+                    est_points += 1
+            eq_step_mV = abs(rate * delay) if rate > 0 and delay > 0 else 0.0
+            text = (
+                "当前 IV 参数换算(固定点间隔):\n"
+                f"- 范围: {range_mV:.6g} mV\n"
+                f"- 固定点间隔 Δt: {delay:.6g} s\n"
+                f"- 扫描速率: {rate:.6g} mV/s\n"
+                f"- 等效步长 ≈ {eq_step_mV:.6g} mV\n"
+            )
+            if total_T > 0:
+                text += f"- 每圈总时长 ≈ {total_T:.6g} s\n"
+            if est_points is not None:
+                text += f"- 每圈点数 ≈ {est_points}\n"
+            text += "关系: 等效步长 ≈ 扫描速率 × 点间隔"
+        else:
+            points = max(2, points)
+            step_mV = range_mV / max(1, points - 1)
+            text = (
+                "当前 IV 参数换算:\n"
+                f"- 范围: {range_mV:.6g} mV\n"
+                f"- 步长: {step_mV:.6g} mV\n"
+                f"- 点数: {points}\n"
+                f"- 点间隔: {delay:.6g} s\n"
+                f"- 扫描速率: {rate:.6g} mV/s\n"
+                "关系: 扫描速率 = 步长 / 点间隔"
+            )
         self.iv_rate_calc_info_var.set(text)
 
     def _parse_iv_rate_seq_text(self, text):
@@ -2861,31 +2912,61 @@ class App:
                 dt = float(point_interval_s)
             except Exception:
                 dt = 0.0
-            if dt < 0:
-                dt = 0.0
-            step_v = (rate * dt) / 1000.0 if rate > 0 and dt > 0 else 0.0
-            one_cycle = self._build_iv_levels_by_step(
-                start,
-                stop,
-                step_v,
-                back_and_forth,
-                triangle_from_zero,
-            )
+            if dt <= 0:
+                self._log("固定点间隔模式下点间隔必须为正数，已停止。")
+                break
+            rate_vps = rate / 1000.0 if rate > 0 else 0.0
+            if rate_vps <= 0:
+                self._log("固定点间隔模式下扫描速率必须为正数，已停止。")
+                break
+
+            if triangle_from_zero:
+                endpoints = [0.0, stop, start, 0.0]
+            elif back_and_forth:
+                endpoints = [start, stop, start]
+            else:
+                endpoints = [start, stop]
+
+            segments = []
+            total_T = 0.0
+            for v0, v1 in zip(endpoints, endpoints[1:]):
+                dur = abs(v1 - v0) / rate_vps
+                segments.append((total_T, total_T + dur, v0, v1))
+                total_T += dur
+            if total_T <= 0:
+                self._log("固定点间隔模式下总时长为 0，已停止。")
+                break
+
+            tick_times = [0.0]
+            while tick_times[-1] + dt < total_T:
+                tick_times.append(tick_times[-1] + dt)
+            if tick_times[-1] < total_T:
+                tick_times.append(total_T)
+
+            def level_at(t_rel: float) -> float:
+                for t_start, t_end, v0, v1 in segments:
+                    if t_rel <= t_end + 1e-12:
+                        dur = t_end - t_start
+                        if dur <= 0:
+                            return float(v1)
+                        frac = (t_rel - t_start) / dur
+                        return float(v0 + (v1 - v0) * frac)
+                return float(endpoints[-1])
+
             rate_desc = f"{rate:g}" if rate > 0 else "N/A"
             self._log(
                 f"Cycle {cyc + 1}/{cycles}: rate={rate_desc} mV/s, "
-                f"point_interval={dt:.6g}s, step={step_v:.6g}V"
+                f"point_interval={dt:.6g}s, total_T={total_T:.6g}s, points={len(tick_times)}"
             )
             if not is_2636b:
-                first_level = float(one_cycle[0]) if one_cycle else float(start)
-                self.instrument.configure_source(source_mode, first_level, compliance)
-            t0 = time.perf_counter()
-            cycle_start = t0
-            for idx_in_cycle, level in enumerate(one_cycle):
+                self.instrument.configure_source(source_mode, float(endpoints[0]), compliance)
+            cycle_start = time.perf_counter()
+            for idx_in_cycle, t_rel in enumerate(tick_times):
                 if self.stop_event.is_set():
                     break
-                if not sleep_until(t0 + idx_in_cycle * dt):
+                if not sleep_until(cycle_start + t_rel):
                     break
+                level = level_at(t_rel)
                 if is_2636b:
                     self.instrument.set_level_2636(source_mode, float(level))
                 else:
@@ -2901,10 +2982,10 @@ class App:
             if self.stop_event.is_set():
                 break
             cycle_elapsed = time.perf_counter() - cycle_start
-            if one_cycle:
-                avg_per_point = cycle_elapsed / len(one_cycle)
+            if tick_times:
+                avg_per_point = cycle_elapsed / len(tick_times)
                 self._log(
-                    f"Cycle {cyc + 1} done: points={len(one_cycle)}, "
+                    f"Cycle {cyc + 1} done: points={len(tick_times)}, "
                     f"elapsed={cycle_elapsed:.3f}s, avg/pt={avg_per_point:.6f}s"
                 )
             if cyc < cycles - 1 and cycle_delay > 0:
@@ -3095,7 +3176,7 @@ class App:
         except tk.TclError:
             messagebox.showwarning("输入错误", "IV 参数无效")
             return None
-        if step <= 0:
+        if rate_timing_mode == "by_step" and step <= 0:
             messagebox.showwarning("输入错误", "步长必须为正数")
             return None
         if point_delay < 0 or cycle_delay < 0:
@@ -3112,9 +3193,14 @@ class App:
             if cycles < 1:
                 messagebox.showwarning("输入错误", "循环次数/圈数必须 >= 1")
                 return None
-        if points < 2:
-            messagebox.showwarning("输入错误", "点数至少为 2")
-            return None
+        if rate_timing_mode == "by_step":
+            if points < 2:
+                messagebox.showwarning("输入错误", "点数至少为 2")
+                return None
+        else:
+            if points < 1:
+                messagebox.showwarning("输入错误", "点数至少为 1")
+                return None
         if scan_rate < 0:
             messagebox.showwarning("输入错误", "扫描速率不能为负")
             return None
@@ -3158,6 +3244,41 @@ class App:
                     self._log("提示: 步长仅在缓存模式/内置 sweep 时生效，当前按点数生成扫描。")
             except Exception:
                 pass
+        if rate_timing_mode == "by_interval":
+            if point_delay <= 0:
+                messagebox.showwarning("输入错误", "固定点间隔模式下点间隔必须为正数")
+                return None
+            if triangle_from_zero:
+                endpoints = [0.0, stop, start, 0.0]
+            elif self.iv_backforth_var.get():
+                endpoints = [start, stop, start]
+            else:
+                endpoints = [start, stop]
+
+            def cycle_rate(cyc_idx: int) -> float:
+                if rate_seq:
+                    if cyc_idx < len(rate_seq):
+                        return rate_seq[cyc_idx]
+                    return rate_seq[cyc_idx % len(rate_seq)] if rate_seq_repeat else rate_seq[-1]
+                return scan_rate if scan_rate > 0 else 0.0
+
+            total_points = 0
+            per_cycle = 0
+            for cyc in range(max(1, cycles)):
+                cycle_rate_mVps = cycle_rate(cyc)
+                rate_vps = cycle_rate_mVps / 1000.0 if cycle_rate_mVps > 0 else 0.0
+                if rate_vps <= 0:
+                    messagebox.showwarning("输入错误", "固定点间隔模式下扫描速率必须为正数")
+                    return None
+                total_T = 0.0
+                for v0, v1 in zip(endpoints, endpoints[1:]):
+                    total_T += abs(v1 - v0) / rate_vps
+                n_points = int(math.floor(total_T / point_delay)) + 1
+                if total_T - (n_points - 1) * point_delay > 1e-9:
+                    n_points += 1
+                if cyc == 0:
+                    per_cycle = n_points
+                total_points += n_points
         range_mV = abs(stop - start) * 1000.0
         step_mV_effective = range_mV / max(1, points - 1)
         if scan_rate > 0 and rate_timing_mode == "by_step":
