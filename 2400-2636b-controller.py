@@ -1237,6 +1237,7 @@ class App:
         self._build_rt_tab()
         self._build_pt_tab()
         self._build_ofr_tab()
+        self._build_tools_tab()
 
         log_frame = ttk.Labelframe(log_container, text="日志", padding=6)
         log_frame.pack(fill="both", expand=True)
@@ -1411,6 +1412,7 @@ class App:
 
     def _build_iv_tab(self):
         frame = ttk.Frame(self.notebook, padding=6)
+        self.iv_tab_frame = frame
         self.notebook.add(frame, text="IV 扫描")
 
         frame.columnconfigure(0, weight=1)
@@ -1430,7 +1432,7 @@ class App:
         self.iv_triangle_from_zero_var = tk.BooleanVar(value=False)
         self.iv_delay_var = tk.DoubleVar(value=0.0)
         self.iv_scan_rate_var = tk.DoubleVar(value=0.0)
-        self.iv_rate_lock_var = tk.StringVar(value="points")
+        self.iv_rate_lock_var = tk.StringVar(value="固定点数")
         self.iv_rate_seq_text = tk.StringVar(value="")
         self.iv_rate_seq_repeat_var = tk.BooleanVar(value=False)
         self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
@@ -1469,23 +1471,25 @@ class App:
         step_entry = ttk.Entry(inner, textvariable=self.iv_step_var, width=10)
         step_entry.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="点数:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        points_entry = ttk.Entry(inner, textvariable=self.iv_points_var, width=10)
-        points_entry.grid(row=row, column=3, sticky="w", pady=4)
+        self.iv_points_entry = ttk.Entry(inner, textvariable=self.iv_points_var, width=10)
+        self.iv_points_entry.grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
         ttk.Label(inner, text="点间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
-        ttk.Entry(inner, textvariable=self.iv_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
+        self.iv_delay_entry = ttk.Entry(inner, textvariable=self.iv_delay_var, width=10)
+        self.iv_delay_entry.grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="扫描速率(mV/s):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        ttk.Entry(inner, textvariable=self.iv_scan_rate_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        self.iv_scan_rate_entry = ttk.Entry(inner, textvariable=self.iv_scan_rate_var, width=10)
+        self.iv_scan_rate_entry.grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
         ttk.Label(inner, text="圈间隔(s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="锁定:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="联动优先保持:").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Combobox(
             inner,
             textvariable=self.iv_rate_lock_var,
-            values=["points", "point_interval", "scan_rate"],
+            values=["固定点数", "固定点间隔", "固定扫描速率"],
             state="readonly",
             width=16,
         ).grid(row=row, column=3, sticky="w", pady=4)
@@ -1565,7 +1569,7 @@ class App:
 
         # 步长 / 点数 联动
         step_entry.bind("<FocusOut>", lambda e: self._update_points_from_step())
-        points_entry.bind("<FocusOut>", lambda e: self._update_step_from_points())
+        self.iv_points_entry.bind("<FocusOut>", lambda e: self._update_step_from_points())
         for var, changed in (
             (self.iv_start_var, "range"),
             (self.iv_stop_var, "range"),
@@ -1577,8 +1581,9 @@ class App:
             var.trace_add("write", lambda *args, ch=changed: self._iv_sync_rate_delay_points(ch))
         self.iv_rate_lock_var.trace_add(
             "write",
-            lambda *args: self._iv_sync_rate_delay_points("points"),
+            lambda *args: (self._sync_iv_lock_widgets(), self._iv_sync_rate_delay_points("lock")),
         )
+        self._sync_iv_lock_widgets()
 
     def _toggle_iv_quality_frame(self):
         if self.iv_quality_enabled_var.get():
@@ -1603,47 +1608,78 @@ class App:
         except Exception:
             pass
 
-    def _parse_iv_rate_seq_text(self, text):
-        rates = []
-        for part in (text or "").split(","):
-            item = part.strip()
-            if not item:
-                continue
-            try:
-                val = float(item)
-            except Exception:
-                continue
-            if val > 0:
-                rates.append(val)
-        return rates
+    def _make_scrollable(self, parent):
+        container = ttk.Frame(parent)
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
 
-    def _open_iv_rate_tool(self):
-        win = tk.Toplevel(self.root)
-        win.title("IV 扫描速率工具")
-        win.transient(self.root)
-        win.grab_set()
+        inner_frame = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner_frame, anchor="nw")
 
-        frame = ttk.Frame(win, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        win.rowconfigure(0, weight=1)
-        win.columnconfigure(0, weight=1)
+        def on_frame_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
-        seq_frame = ttk.Labelframe(frame, text="速率序列(mV/s)", padding=8)
-        seq_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        def on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def on_mousewheel(event):
+            if getattr(event, "delta", 0):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+
+        inner_frame.bind("<Configure>", on_frame_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", on_mousewheel)
+        canvas.bind("<Button-5>", on_mousewheel)
+
+        container.scroll_canvas = canvas
+        return container, inner_frame
+
+    def _build_tools_tab(self):
+        frame = ttk.Frame(self.notebook, padding=6)
+        self.tools_tab_frame = frame
+        self.notebook.add(frame, text="工具")
+
+        container, inner_frame = self._make_scrollable(frame)
+        self.tools_scroll_canvas = getattr(container, "scroll_canvas", None)
+        container.pack(fill="both", expand=True)
+
+        inner_frame.columnconfigure(0, weight=1)
+        inner_frame.columnconfigure(1, weight=1)
+
+        left = ttk.Labelframe(inner_frame, text="序列扫圈（扫描速率序列）", padding=8)
+        right = ttk.Labelframe(inner_frame, text="IV 扫描换算/速率", padding=8)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        right.grid(row=0, column=1, sticky="nsew")
+
+        self._build_rate_sequence_tool(left)
+        self._build_iv_rate_calc_tool(right)
+
+    def _build_rate_sequence_tool(self, parent):
+        parent.columnconfigure(0, weight=1)
+        if not hasattr(self, "iv_rate_mode_var"):
+            self.iv_rate_mode_var = tk.StringVar(value="multi_forward")
 
         entry_var = tk.StringVar(value="")
-        entry = ttk.Entry(seq_frame, textvariable=entry_var, width=12)
+        entry = ttk.Entry(parent, textvariable=entry_var, width=12)
         entry.grid(row=0, column=0, sticky="w")
-        ttk.Button(seq_frame, text="添加", command=lambda: add_rate()).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(parent, text="添加", command=lambda: add_rate()).grid(row=0, column=1, padx=(6, 0))
 
-        listbox = tk.Listbox(seq_frame, height=8, width=22)
+        listbox = tk.Listbox(parent, height=8, width=22)
         listbox.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=6)
-        seq_frame.rowconfigure(1, weight=1)
-        seq_frame.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
 
-        btn_frame = ttk.Frame(seq_frame)
+        btn_frame = ttk.Frame(parent)
         btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Button(btn_frame, text="删除", command=lambda: remove_rate()).grid(row=0, column=0)
         ttk.Button(btn_frame, text="上移", command=lambda: move_rate(-1)).grid(row=0, column=1, padx=4)
@@ -1651,15 +1687,13 @@ class App:
         ttk.Button(btn_frame, text="清空", command=lambda: clear_rates()).grid(row=0, column=3, padx=4)
 
         ttk.Checkbutton(
-            seq_frame,
+            parent,
             text="序列不足时循环",
             variable=self.iv_rate_seq_repeat_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        mode_frame = ttk.Labelframe(frame, text="扫描模式", padding=8)
-        mode_frame.grid(row=0, column=1, sticky="nsew")
-
-        mode_var = tk.StringVar(value="multi_forward")
+        mode_frame = ttk.Labelframe(parent, text="扫描模式", padding=8)
+        mode_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
 
         def infer_mode():
             if self.iv_cycles_var.get() == 1 and not self.iv_backforth_var.get():
@@ -1669,7 +1703,7 @@ class App:
             return "multi_forward"
 
         def apply_mode():
-            mode = mode_var.get()
+            mode = self.iv_rate_mode_var.get()
             if mode == "single_forward":
                 self.iv_cycles_var.set(1)
                 self.iv_backforth_var.set(False)
@@ -1681,25 +1715,25 @@ class App:
                 self.iv_backforth_var.set(True)
                 self.iv_triangle_from_zero_var.set(False)
 
-        mode_var.set(infer_mode())
+        self.iv_rate_mode_var.set(infer_mode())
         ttk.Radiobutton(
             mode_frame,
             text="单次单方向",
-            variable=mode_var,
+            variable=self.iv_rate_mode_var,
             value="single_forward",
             command=apply_mode,
         ).grid(row=0, column=0, sticky="w", pady=2)
         ttk.Radiobutton(
             mode_frame,
             text="多次单方向",
-            variable=mode_var,
+            variable=self.iv_rate_mode_var,
             value="multi_forward",
             command=apply_mode,
         ).grid(row=1, column=0, sticky="w", pady=2)
         ttk.Radiobutton(
             mode_frame,
             text="多次来回",
-            variable=mode_var,
+            variable=self.iv_rate_mode_var,
             value="multi_backforth",
             command=apply_mode,
         ).grid(row=2, column=0, sticky="w", pady=2)
@@ -1757,13 +1791,115 @@ class App:
             sync_text_from_list([])
             refresh_list()
 
+        self.iv_rate_seq_text.trace_add("write", lambda *args: refresh_list())
         refresh_list()
+
+    def _build_iv_rate_calc_tool(self, parent):
+        parent.columnconfigure(0, weight=1)
+        self.iv_rate_calc_info_var = tk.StringVar(value="")
+        info_label = ttk.Label(
+            parent,
+            textvariable=self.iv_rate_calc_info_var,
+            justify="left",
+            anchor="w",
+        )
+        info_label.grid(row=0, column=0, sticky="ew")
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(btn_frame, text="按当前 IV 参数刷新显示", command=self._refresh_iv_rate_calc_info).grid(
+            row=0, column=0, sticky="w"
+        )
+        if hasattr(self, "iv_tab_frame"):
+            ttk.Button(btn_frame, text="跳转到 IV 扫描页", command=lambda: self.notebook.select(self.iv_tab_frame)).grid(
+                row=0, column=1, padx=(6, 0)
+            )
+        self._refresh_iv_rate_calc_info()
+
+    def _refresh_iv_rate_calc_info(self):
+        try:
+            start = float(self.iv_start_var.get())
+            stop = float(self.iv_stop_var.get())
+            points = int(self.iv_points_var.get())
+            delay = float(self.iv_delay_var.get())
+            rate = float(self.iv_scan_rate_var.get())
+        except tk.TclError:
+            return
+        points = max(2, points)
+        range_mV = abs(stop - start) * 1000.0
+        step_mV = range_mV / max(1, points - 1)
+        text = (
+            "当前 IV 参数换算:\n"
+            f"- 范围: {range_mV:.6g} mV\n"
+            f"- 步长: {step_mV:.6g} mV\n"
+            f"- 点数: {points}\n"
+            f"- 点间隔: {delay:.6g} s\n"
+            f"- 扫描速率: {rate:.6g} mV/s\n"
+            "关系: 扫描速率 = 步长 / 点间隔"
+        )
+        self.iv_rate_calc_info_var.set(text)
+
+    def _parse_iv_rate_seq_text(self, text):
+        rates = []
+        for part in (text or "").split(","):
+            item = part.strip()
+            if not item:
+                continue
+            try:
+                val = float(item)
+            except Exception:
+                continue
+            if val > 0:
+                rates.append(val)
+        return rates
+
+    def _open_iv_rate_tool(self):
+        target = getattr(self, "tools_tab_frame", None)
+        if target is None:
+            for tab_id in self.notebook.tabs():
+                if self.notebook.tab(tab_id, "text") == "工具":
+                    target = tab_id
+                    break
+        if target is not None:
+            self.notebook.select(target)
+        if getattr(self, "tools_scroll_canvas", None) is not None:
+            try:
+                self.tools_scroll_canvas.yview_moveto(0)
+            except Exception:
+                pass
 
     def _update_points_from_step(self):
         self._iv_sync_rate_delay_points("step")
 
     def _update_step_from_points(self):
         self._iv_sync_rate_delay_points("points")
+
+    def _sync_iv_lock_widgets(self):
+        lock = self._normalize_iv_lock()
+        widgets = {
+            "points": getattr(self, "iv_points_entry", None),
+            "point_interval": getattr(self, "iv_delay_entry", None),
+            "scan_rate": getattr(self, "iv_scan_rate_entry", None),
+        }
+        for key, widget in widgets.items():
+            if widget is None:
+                continue
+            try:
+                if lock == key:
+                    widget.state(["disabled"])
+                else:
+                    widget.state(["!disabled"])
+            except Exception:
+                pass
+
+    def _normalize_iv_lock(self):
+        lock = self.iv_rate_lock_var.get()
+        mapping = {
+            "固定点数": "points",
+            "固定点间隔": "point_interval",
+            "固定扫描速率": "scan_rate",
+        }
+        return mapping.get(lock, lock)
 
     def _iv_sync_rate_delay_points(self, changed: str):
         if self._iv_sync_guard:
@@ -1776,7 +1912,7 @@ class App:
                 points = int(self.iv_points_var.get())
                 delay = float(self.iv_delay_var.get())
                 rate = float(self.iv_scan_rate_var.get())
-                lock = self.iv_rate_lock_var.get()
+                lock = self._normalize_iv_lock()
             except tk.TclError:
                 return
 
