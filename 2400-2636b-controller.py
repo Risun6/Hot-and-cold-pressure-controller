@@ -498,6 +498,21 @@ class KeithleyInstrument:
             except Exception:
                 pass
 
+    def get_nplc(self) -> float | None:
+        """读取当前采样积分时间（NPLC）。仿真或未连接时返回 None。"""
+        with self.lock:
+            if self.simulated or self.session is None:
+                return None
+            model = getattr(self, "model", None)
+            try:
+                if model == "2636B":
+                    reply = self.session.query(f"print({self._measure_ch()}.measure.nplc)")
+                else:
+                    reply = self.session.query("SENS:CURR:NPLC?")
+                return float(str(reply).strip())
+            except Exception:
+                return None
+
     def _warn(self, msg: str):
         try:
             if callable(self.log_callback):
@@ -1414,6 +1429,7 @@ class App:
         self.iv_backforth_var = tk.BooleanVar(value=False)
         self.iv_triangle_from_zero_var = tk.BooleanVar(value=False)
         self.iv_delay_var = tk.DoubleVar(value=0.0)
+        self.iv_cycle_delay_var = tk.DoubleVar(value=0.0)
         self.iv_compliance_var = tk.DoubleVar(value=0.1)
         self.iv_quality_k_var = tk.DoubleVar(value=8.0)
         self.iv_quality_jump_ratio_var = tk.DoubleVar(value=0.02)
@@ -1452,10 +1468,14 @@ class App:
         points_entry.grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.iv_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
-        ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
-        ttk.Entry(inner, textvariable=self.iv_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        ttk.Label(inner, text="圈间隔 (s):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
+        ttk.Entry(inner, textvariable=self.iv_cycle_delay_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
+        row += 1
+
+        ttk.Label(inner, text="保护电流(A):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Entry(inner, textvariable=self.iv_compliance_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         row += 1
 
         self.iv_backforth_chk = ttk.Checkbutton(
@@ -1609,7 +1629,7 @@ class App:
         ttk.Entry(inner, textvariable=self.it_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.it_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1649,7 +1669,7 @@ class App:
         ttk.Entry(inner, textvariable=self.vt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电压(V):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.vt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1689,7 +1709,7 @@ class App:
         ttk.Entry(inner, textvariable=self.rt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.rt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1729,7 +1749,7 @@ class App:
         ttk.Entry(inner, textvariable=self.pt_points_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
         row += 1
 
-        ttk.Label(inner, text="间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
+        ttk.Label(inner, text="点间隔 (s):").grid(row=row, column=0, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_delay_var, width=10).grid(row=row, column=1, sticky="w", pady=4, padx=(0, 10))
         ttk.Label(inner, text="保护电流(A):").grid(row=row, column=2, sticky="e", pady=4, padx=(0, 4))
         ttk.Entry(inner, textvariable=self.pt_compliance_var, width=10).grid(row=row, column=3, sticky="w", pady=4)
@@ -1927,6 +1947,21 @@ class App:
         sense_str = "ON" if enable else "OFF"
         self.status_label.config(text=f"{status} | 四线: {sense_str}")
 
+    def _compute_effective_nplc(self, low_current_mode: bool, model: str | None) -> float:
+        try:
+            nplc = float(self.integration_time_var.get())
+        except Exception:
+            nplc = 0.0
+
+        model_upper = (model or "").upper()
+        if nplc <= 0:
+            if low_current_mode:
+                nplc = 0.01
+            else:
+                nplc = 0.01 if model_upper == "2636B" else 0.1
+
+        return max(0.01, min(nplc, 10.0))
+
     def connect_instrument(self):
         selected_model = self.model_select_var.get()
         forced_model = selected_model if selected_model in ("2400", "2636B") else None
@@ -1955,8 +1990,19 @@ class App:
         except Exception as exc:
             self._log(f"设置四线制失败: {exc}")
 
+        low_current_mode = bool(self.low_current_speed_mode_var.get())
+        model = getattr(self.instrument, "model", None)
+        effective_nplc = self._compute_effective_nplc(low_current_mode, model)
+        try:
+            self.instrument.set_nplc(effective_nplc)
+            readback = self.instrument.get_nplc()
+        except Exception:
+            readback = None
+        self._log(f"NPLC set -> {effective_nplc}, readback -> {readback if readback is not None else 'N/A'}")
+
         sense_str = "ON" if enable else "OFF"
-        self.status_label.config(text=f"{status} | 四线: {sense_str}")
+        nplc_display = readback if readback is not None else effective_nplc
+        self.status_label.config(text=f"{status} | 四线: {sense_str} | NPLC: {nplc_display}")
         self._log(f"{status} | 四线: {sense_str}")
 
     def choose_save_root(self):
@@ -2011,19 +2057,14 @@ class App:
         low_current_mode = bool(config.get("low_current_speed_mode", False))
         self.instrument.set_low_current_mode(low_current_mode)
         self.instrument.current_range_override = config.get("current_range_override")
-        try:
-            nplc = float(self.integration_time_var.get())
-        except Exception:
-            nplc = 0.0
-
-        model_upper = (model or "").upper()
-        if nplc <= 0:
-            nplc = 0.01 if low_current_mode else (0.01 if model_upper == "2636B" else 0.1)
+        nplc = self._compute_effective_nplc(low_current_mode, model)
 
         try:
             self.instrument.set_nplc(nplc)
+            readback = self.instrument.get_nplc()
         except Exception:
-            pass
+            readback = None
+        self._log(f"NPLC set -> {nplc}, readback -> {readback if readback is not None else 'N/A'}")
 
         self.current_mode = mode
         # 只在 IV 模式下记录源模式，其它模式用 None
@@ -2098,68 +2139,95 @@ class App:
         cycles = cfg["cycles"]
         back_and_forth = cfg["back_and_forth"]
         triangle_from_zero = cfg.get("triangle_from_zero", False)
-        delay = cfg["delay"]
+        point_delay = cfg.get("point_delay", cfg.get("delay", 0.0))
+        cycle_delay = cfg.get("cycle_delay", 0.0)
         compliance = cfg["compliance"]
         source_mode = cfg["source_mode"]
         buffer_mode = bool(cfg.get("buffer_mode", False))
-        levels_from_cfg = cfg.get("levels") if buffer_mode else None
+        levels_from_cfg = cfg.get("levels_one_cycle") if buffer_mode else None
+        delay_source = "point_delay" if "point_delay" in cfg else "delay"
+
+        self._log(
+            f"IV timing: point_interval={point_delay}s, cycle_interval={cycle_delay}s, "
+            f"cycles={cycles}, buffer_mode={buffer_mode}, source={delay_source}"
+        )
+        self._log("实际点间隔会叠加测量耗时(NPLC/通讯)，尤其在非缓存模式下")
 
         if buffer_mode and isinstance(levels_from_cfg, (list, tuple)):
-            seq = list(levels_from_cfg)
+            one_cycle = list(levels_from_cfg)
         else:
             base_forward = self.instrument.sweep_points(start, stop, points)
             if triangle_from_zero:
                 seg1 = self.instrument.sweep_points(0, stop, points)
                 seg2 = self.instrument.sweep_points(stop, start, points)[1:]
                 seg3 = self.instrument.sweep_points(start, 0, points)[1:]
-                one_cycle = np.concatenate([seg1, seg2, seg3])
+                one_cycle = list(np.concatenate([seg1, seg2, seg3]))
             elif back_and_forth:
                 if len(base_forward) > 1:
                     backward = base_forward[-2::-1]
                 else:
                     backward = base_forward
-                one_cycle = np.concatenate([base_forward, backward])
+                one_cycle = list(np.concatenate([base_forward, backward]))
             else:
-                one_cycle = base_forward
-            seq = np.tile(one_cycle, cycles)
+                one_cycle = list(base_forward)
         is_2636b = (getattr(self.instrument, "model", "") or "").upper() == "2636B"
         if is_2636b:
             self.instrument.prepare_source_2636(source_mode, compliance)
         else:
-            self.instrument.configure_source(source_mode, float(seq[0]), compliance)
+            self.instrument.configure_source(source_mode, float(one_cycle[0]), compliance)
 
         if buffer_mode and not self.instrument.simulated and self.instrument.session is not None:
             try:
-                if is_2636b:
-                    readings = self.instrument.buffer_sweep_2636(source_mode, compliance, seq, delay)
-                else:
-                    readings = self.instrument.buffer_sweep_2400(source_mode, compliance, seq, delay)
-                for idx, data in enumerate(readings):
-                    sp = float(seq[idx]) if idx < len(seq) else 0.0
-                    data.update({"index": idx, "setpoint": sp})
-                    data["mode"] = "IV"
-                    # 实时写入：绝不阻塞
-                    self._stream_submit(data)
-                    self.queue.put(("data", data, self.total_points))
+                for cyc in range(cycles):
+                    if is_2636b:
+                        readings = self.instrument.buffer_sweep_2636(
+                            source_mode,
+                            compliance,
+                            one_cycle,
+                            point_delay,
+                        )
+                    else:
+                        readings = self.instrument.buffer_sweep_2400(
+                            source_mode,
+                            compliance,
+                            one_cycle,
+                            point_delay,
+                        )
+                    for idx, data in enumerate(readings):
+                        sp = float(one_cycle[idx]) if idx < len(one_cycle) else 0.0
+                        global_idx = cyc * len(one_cycle) + idx
+                        data.update({"index": global_idx, "setpoint": sp, "cycle": cyc + 1})
+                        data["mode"] = "IV"
+                        # 实时写入：绝不阻塞
+                        self._stream_submit(data)
+                        self.queue.put(("data", data, self.total_points))
+                    if cyc < cycles - 1 and cycle_delay > 0 and not self.stop_event.is_set():
+                        time.sleep(cycle_delay)
                 return
             except Exception as exc:
                 self._log(f"缓存模式失败，回退到逐点: {exc}")
 
-        for idx, level in enumerate(seq):
+        for cyc in range(cycles):
+            for idx_in_cycle, level in enumerate(one_cycle):
+                if self.stop_event.is_set():
+                    break
+                if is_2636b:
+                    self.instrument.set_level_2636(source_mode, float(level))
+                else:
+                    self.instrument.configure_source(source_mode, float(level), compliance)
+                if point_delay and point_delay > 0:
+                    time.sleep(point_delay)
+                data = self.instrument.measure_once()
+                global_idx = cyc * len(one_cycle) + idx_in_cycle
+                data.update({"index": global_idx, "setpoint": float(level), "cycle": cyc + 1})
+                data["mode"] = "IV"
+                # 实时写入：绝不阻塞
+                self._stream_submit(data)
+                self.queue.put(("data", data, self.total_points))
             if self.stop_event.is_set():
                 break
-            if is_2636b:
-                self.instrument.set_level_2636(source_mode, float(level))
-            else:
-                self.instrument.configure_source(source_mode, float(level), compliance)
-            if delay and delay > 0:
-                time.sleep(delay)
-            data = self.instrument.measure_once()
-            data.update({"index": idx, "setpoint": float(level)})
-            data["mode"] = "IV"
-            # 实时写入：绝不阻塞
-            self._stream_submit(data)
-            self.queue.put(("data", data, self.total_points))
+            if cyc < cycles - 1 and cycle_delay > 0:
+                time.sleep(cycle_delay)
 
     def _run_time_measurement(self, cfg, source_mode, mode=None):
         mode = mode or self.current_mode
@@ -2286,7 +2354,8 @@ class App:
             step = self.iv_step_var.get()
             points = self.iv_points_var.get()
             cycles = self.iv_cycles_var.get()
-            delay = self.iv_delay_var.get()
+            point_delay = self.iv_delay_var.get()
+            cycle_delay = self.iv_cycle_delay_var.get()
             compliance = self.iv_compliance_var.get()
             source_mode = self.iv_source_mode_var.get()
         except tk.TclError:
@@ -2295,8 +2364,8 @@ class App:
         if step <= 0:
             messagebox.showwarning("输入错误", "步长必须为正数")
             return None
-        if delay < 0:
-            messagebox.showwarning("输入错误", "间隔时间不能为负")
+        if point_delay < 0 or cycle_delay < 0:
+            messagebox.showwarning("输入错误", "IV 参数无效")
             return None
         if compliance <= 0:
             messagebox.showwarning("输入错误", "保护值必须为正数")
@@ -2318,18 +2387,19 @@ class App:
             per_cycle = points
         buffer_mode = bool(self.buffer_mode_var.get())
         triangle_from_zero = self.iv_triangle_from_zero_var.get()
-        levels = None
+        levels_one_cycle = None
         if buffer_mode:
-            levels = self._build_iv_levels(
+            levels_one_cycle = self._build_iv_levels(
                 start,
                 stop,
                 step,
                 points,
-                cycles,
+                1,
                 self.iv_backforth_var.get(),
                 triangle_from_zero,
             )
-            total_points = len(levels)
+            per_cycle = len(levels_one_cycle)
+            total_points = per_cycle * max(1, cycles)
         else:
             total_points = max(0, per_cycle * max(1, cycles))
             try:
@@ -2346,14 +2416,17 @@ class App:
             cycles=cycles,
             back_and_forth=self.iv_backforth_var.get(),
             triangle_from_zero=triangle_from_zero,
-            delay=delay,
+            delay=point_delay,
+            point_delay=point_delay,
+            cycle_delay=cycle_delay,
+            per_cycle=per_cycle,
             compliance=compliance,
             source_mode="Voltage" if source_mode == "Voltage" else "Current",
             total_points=total_points,
             low_current_speed_mode=self.low_current_speed_mode_var.get(),
             current_range_override=self._get_current_range_override_value(),
             buffer_mode=buffer_mode,
-            levels=levels if buffer_mode else None,
+            levels_one_cycle=levels_one_cycle if buffer_mode else None,
         )
 
     def _collect_it_config(self):
@@ -3364,6 +3437,7 @@ class App:
         self.iv_backforth_var.set(iv.get("back_and_forth", False))
         self.iv_triangle_from_zero_var.set(iv.get("triangle_from_zero", False))
         self.iv_delay_var.set(iv.get("delay", 0.0))
+        self.iv_cycle_delay_var.set(iv.get("cycle_delay", 0.0))
         self.iv_compliance_var.set(iv.get("compliance", 0.1))
 
         iv_quality = cfg.get("iv_quality", {})
