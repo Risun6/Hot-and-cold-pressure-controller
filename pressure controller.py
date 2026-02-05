@@ -1832,6 +1832,12 @@ class App(ttk.Frame):
         )
         self.export_btn.pack(side=tk.LEFT, padx=5, pady=2)
 
+        self.export_data_btn = ttk.Button(
+            chart_btn_frame, text="Export Data",
+            command=self.export_data_table, state="disabled", bootstyle="info"
+        )
+        self.export_data_btn.pack(side=tk.LEFT, padx=5, pady=2)
+
         self.clear_chart_btn = ttk.Button(
             chart_btn_frame, text="Clear Chart",
             command=self.clear_chart, bootstyle="warning"
@@ -3049,6 +3055,12 @@ class App(ttk.Frame):
             return
         threading.Thread(target=self._stop_motion_worker, daemon=True).start()
 
+    def _after_stop(self, guard: bool):
+        self._no_autostart_until = time.time() + 0.6 if guard else 0.0
+        self._mc_last_cmd_ts = 0.0
+        self._mc_last_dir = self._mc_last_speed = self._mc_last_distance = None
+        self.set_var_safe(self.current_speed_var, "0.000")
+
     def _stop_motion_worker(self):
         try:
             resp2 = self.modbus2.write_registers(180, [1, 0], delay=0.005)
@@ -3056,10 +3068,28 @@ class App(ttk.Frame):
         except Exception as e:
             self.log(f"停止命令失败: {e}")
         finally:
-            self._no_autostart_until = time.time() + 0.6
-            self._mc_last_cmd_ts = 0.0
-            self._mc_last_dir = self._mc_last_speed = self._mc_last_distance = None
-            self.set_var_safe(self.current_speed_var, "0.000")
+            guard = not getattr(self, "jump_running", False)
+            self._after_stop(guard=guard)
+
+    def stop_motion_sync(self, timeout_s: float = 2.0):
+        if not self.modbus2:
+            return
+        try:
+            self.modbus2.write_registers(180, [1, 0], delay=0.005)
+        except Exception as e:
+            self.log(f"停止命令失败(sync): {e}")
+        finally:
+            guard = not getattr(self, "jump_running", False)
+            self._after_stop(guard=guard)
+
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            try:
+                if abs(float(self.read_speed())) < 1e-3:
+                    break
+            except Exception:
+                break
+            time.sleep(0.02)
 
     def stop_all(self):
         self.stop_multi_pressure_test()
@@ -4220,7 +4250,7 @@ class App(ttk.Frame):
             sheet.add_image(img, 'A1')
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".xlsx",
-                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+                filetypes=[("Excel files", "*.xlsx")],
                 title="Save Chart to Excel"
             )
             if file_path:
@@ -4230,6 +4260,42 @@ class App(ttk.Frame):
                 os.remove(chart_path)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export chart: {e}")
+
+    def export_data_table(self):
+        if not self._history:
+            messagebox.showinfo("提示", "没有采样数据可导出")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx")],
+            title="Export Data Table"
+        )
+        if not path:
+            return
+
+        history = list(self._history)
+        t0 = history[0][0]
+        rows = []
+        for ts, pos, pre in history:
+            wall = datetime.datetime.fromtimestamp(ts).isoformat(timespec="milliseconds")
+            rows.append([wall, ts - t0, float(pre), str(self.current_unit), float(pos)])
+
+        if path.lower().endswith(".csv"):
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["wall_time_iso", "t_rel_s", "pressure", "pressure_unit", "position_mm"])
+                writer.writerows(rows)
+        else:
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "Data"
+            sheet.append(["wall_time_iso", "t_rel_s", "pressure", "pressure_unit", "position_mm"])
+            for row in rows:
+                sheet.append(row)
+            sheet.freeze_panes = "A2"
+            workbook.save(path)
+
+        self.log(f"数据表已导出: {path}")
 
     def reset_chart(self):
         self._time_zero = None
@@ -4926,7 +4992,7 @@ class App(ttk.Frame):
     def _refresh_connection_dependent_controls(self):
         controls = [
             'set_btn', 'start_btn', 'zero_btn', 'move_btn',
-            'jump_btn', 'stop_btn', 'export_btn'
+            'jump_btn', 'stop_btn', 'export_btn', 'export_data_btn'
         ]
         enabled = self.sensor_connected and self.controller_connected
         state = "normal" if enabled else "disabled"
@@ -5177,17 +5243,19 @@ class App(ttk.Frame):
     def start_machine_quiet(self):
         """直接下发启动寄存器（无弹窗），带禁启窗口。"""
         if not self.modbus2:
-            return
+            return False
         # —— 新增：禁止在刚停止后的窗口内重新点火 —— #
-        if time.time() < getattr(self, "_no_autostart_until", 0):
+        if (time.time() < getattr(self, "_no_autostart_until", 0)) and (not getattr(self, "jump_running", False)):
             self.log("抑制自动重启（刚刚停止）")
-            return
+            return False
         self._maybe_prompt_auto_tare()
         try:
             resp2 = self.modbus2.write_registers(178, [1, 0], delay=0.005)
             self.log(f"运动控制器启动命令(quiet): {resp2.hex() if resp2 else ''}")
         except Exception as e:
             self.log(f"启动命令失败(quiet): {e}")
+            return False
+        return True
 
     def _set_motion_params_quiet(self, desired_dir: str, speed_mm_s: float, distance_mm: float):
         """直接写寄存器设置方向/距离/速度，不改UI输入框。"""
@@ -5967,21 +6035,24 @@ class App(ttk.Frame):
                     break
 
                 hit = False
-                t0 = time.time()
+                hit_cnt = 0
+                t0 = time.monotonic()
                 timeout_s = 180.0
 
-                while self.jump_running and (time.time() - t0 <= timeout_s):
+                while self.jump_running and (time.monotonic() - t0 <= timeout_s):
                     cur_p = float(self.read_pressure())
                     # 保护
                     if cur_p >= safety:
                         self.log(f"⚠️ 保护压力触发：{cur_p:.1f} ≥ {safety:.1f} g，急停")
-                        self.stop_motion()
+                        self.stop_motion_sync()
                         self.jump_running = False
                         return
 
                     desired_dir = "下" if target > cur_p else "上"
                     # 本次只跑一个小步长（看门狗行程）
                     step_mm = step_mm_down if desired_dir == "下" else step_mm_up
+                    run_speed = max(run_speed, 1e-6)
+                    max_step_time = min(15.0, max(0.5, step_mm / run_speed * 2.0 + 0.3))
 
                     # 下发参数并启动（带禁启窗口）
                     self._set_motion_params_quiet(desired_dir, run_speed, step_mm)
@@ -5989,24 +6060,31 @@ class App(ttk.Frame):
                     self.set_var_safe(self.current_speed_var, f"{run_speed:.3f}")
 
                     # 在这个小步长内，盯着阈值，达到/越过立即急停
-                    inner_t0 = time.time()
-                    while self.jump_running and time.time() - inner_t0 <= 2.0:  # 一个小步不超过2秒
+                    inner_t0 = time.monotonic()
+                    while self.jump_running and time.monotonic() - inner_t0 <= max_step_time:
                         cur_p = float(self.read_pressure())
 
                         if cur_p >= safety:
                             self.log(f"⚠️ 保护压力触发：{cur_p:.1f} ≥ {safety:.1f} g，急停")
-                            self.stop_motion()
+                            self.stop_motion_sync()
                             self.jump_running = False
                             return
 
                         if (desired_dir == "下" and cur_p >= target) or (desired_dir == "上" and cur_p <= target):
+                            hit_cnt += 1
+                        else:
+                            hit_cnt = 0
+
+                        if hit_cnt >= 3:
                             hit = True
+                            self.stop_motion_sync()
                             break
 
                         time.sleep(0.02)
 
                     # 无论命中与否，小步结束都先停一下，再决定是否续跑
-                    self.stop_motion()
+                    if self.jump_running:
+                        self.stop_motion_sync()
 
                     if hit:
                         break
@@ -6022,15 +6100,15 @@ class App(ttk.Frame):
                 prev_target = target
 
                 # 点间间隔
-                t_end = time.time() + max(0.0, interval_s)
-                while self.jump_running and time.time() < t_end:
-                    time.sleep(0.05)
+                t_end = time.monotonic() + max(0.0, interval_s)
+                while self.jump_running and time.monotonic() < t_end:
+                    time.sleep(0.02)
 
             if loop_cnt != 0:
                 loops_done += 1
             # 如需往返，可在此处： seq = list(reversed(seq))
 
-        self.stop_motion()
+        self.stop_motion_sync()
         self.jump_running = False
         self.log("按实际压力跳变结束")
 
